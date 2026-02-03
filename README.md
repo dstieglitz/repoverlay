@@ -130,6 +130,7 @@ repoverlay clone [--force] [--dry-run]
 |------|-------------|
 | `--force`, `-f` | Overwrite existing `.repoverlay/repo/` and destinations |
 | `--dry-run`, `-n` | Preview changes without executing |
+| `--intellij` | Configure IntelliJ IDEA to track overlay repo as VCS root |
 
 ### `repoverlay sync`
 
@@ -143,6 +144,7 @@ repoverlay sync [--force] [--dry-run]
 |------|-------------|
 | `--force`, `-f` | Overwrite existing destinations |
 | `--dry-run`, `-n` | Preview changes without executing |
+| `--intellij` | Configure IntelliJ IDEA to track overlay repo as VCS root |
 
 ### `repoverlay unlink`
 
@@ -265,6 +267,29 @@ Destination paths are validated:
 - Cannot overwrite `.repoverlay.yaml`, `.repoverlayignore`, or `.repoverlay/`
 - Cannot have duplicates
 - Cannot overlap (e.g., `config` and `config/secrets`)
+
+## IntelliJ IDEA Integration
+
+When working in IntelliJ IDEA (or other JetBrains IDEs), symlinked files from the overlay won't show version control status by default because they live in a different git repository. Use the `--intellij` flag to register the overlay as an additional VCS root:
+
+```bash
+repoverlay clone --intellij
+```
+
+This updates `.idea/vcs.xml` to include `.repoverlay/repo` as a git root, allowing IntelliJ to:
+- Show git status for symlinked overlay files
+- Track changes, diffs, and history for configuration files
+- Commit overlay changes directly from the IDE
+
+The `--intellij` flag is also available on `sync`:
+
+```bash
+repoverlay sync --intellij
+```
+
+When you run `repoverlay unlink --remove-repo`, the VCS root is automatically removed from IntelliJ's configuration.
+
+**Note:** This only works if your project has a `.idea/` directory (i.e., has been opened in IntelliJ).
 
 ## Git Integration
 
