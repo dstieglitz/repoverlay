@@ -6,6 +6,7 @@ import sys
 from . import __version__, git
 from .config import ConfigError, find_config, load_config
 from .output import Output, set_output
+from .intellij import configure_vcs_root, remove_vcs_root
 from .overlay import (
     OverlayError,
     UncommittedChangesError,
@@ -59,6 +60,11 @@ def main() -> int:
         action="store_true",
         help="Preview changes without executing",
     )
+    clone_parser.add_argument(
+        "--intellij",
+        action="store_true",
+        help="Configure IntelliJ IDEA to track overlay repo as VCS root",
+    )
 
     # sync command
     sync_parser = subparsers.add_parser("sync", help="Sync symlinks with current config")
@@ -71,6 +77,11 @@ def main() -> int:
         "--dry-run", "-n",
         action="store_true",
         help="Preview changes without executing",
+    )
+    sync_parser.add_argument(
+        "--intellij",
+        action="store_true",
+        help="Configure IntelliJ IDEA to track overlay repo as VCS root",
     )
 
     # unlink command
@@ -215,6 +226,10 @@ def cmd_clone(args, output: Output) -> int:
         output.error(str(e))
         return 1
 
+    # Configure IntelliJ if requested
+    if args.intellij:
+        configure_vcs_root(root_dir, dry_run=args.dry_run, output=output)
+
     return 0
 
 
@@ -233,10 +248,15 @@ def cmd_sync(args, output: Output) -> int:
             dry_run=args.dry_run,
             output=output,
         )
-        return exit_code
     except OverlayError as e:
         output.error(str(e))
         return 1
+
+    # Configure IntelliJ if requested
+    if args.intellij:
+        configure_vcs_root(root_dir, dry_run=args.dry_run, output=output)
+
+    return exit_code
 
 
 def cmd_unlink(args, output: Output) -> int:
@@ -250,6 +270,40 @@ def cmd_unlink(args, output: Output) -> int:
     root_dir = config_path.parent
     remove_repo = args.remove_repo
     force = args.force
+    repo_dir = get_repo_dir(root_dir)
+
+    # Pre-check for uncommitted/unpushed changes before any prompts
+    if not args.dry_run and repo_dir.exists() and (repo_dir / ".git").exists():
+        # Check for unpushed commits first - hard block
+        has_unpushed, commit_count = git.has_unpushed_commits(repo_dir)
+        if has_unpushed:
+            output.error(
+                f"Cannot unlink - there are {commit_count} unpushed commit(s) in the overlay repo.\n"
+                "Run 'repoverlay push' first, or remove the commits with 'git reset'."
+            )
+            return 1
+
+        # Check for uncommitted changes - prompt before other questions
+        if not force:
+            has_uncommitted, changed_files = git.has_uncommitted_changes(repo_dir)
+            if has_uncommitted:
+                output.warning("Uncommitted changes detected in overlay repo:")
+                for changed_file in changed_files:
+                    output.info(f"  {changed_file}")
+                if sys.stdin.isatty():
+                    try:
+                        response = input("Continue anyway? [y/N] ").strip().lower()
+                        if response in ("y", "yes"):
+                            force = True
+                        else:
+                            output.info("Use --force to proceed with uncommitted changes.")
+                            return 1
+                    except (EOFError, KeyboardInterrupt):
+                        print()  # Newline after ^C
+                        return 1
+                else:
+                    output.info("Use --force to proceed with uncommitted changes.")
+                    return 1
 
     # If not using --remove-repo and not dry-run, prompt the user
     if not remove_repo and not args.dry_run:
@@ -260,7 +314,7 @@ def cmd_unlink(args, output: Output) -> int:
                 remove_repo = response in ("y", "yes")
             except (EOFError, KeyboardInterrupt):
                 print()  # Newline after ^C
-                remove_repo = False
+                return 1
 
     try:
         unlink_overlay(
@@ -270,33 +324,17 @@ def cmd_unlink(args, output: Output) -> int:
             dry_run=args.dry_run,
             output=output,
         )
+        # Clean up IntelliJ VCS root if removing repo
+        if remove_repo:
+            remove_vcs_root(root_dir, dry_run=args.dry_run, output=output)
     except UnpushedCommitsError as e:
         output.error(str(e))
         return 1
     except UncommittedChangesError as e:
-        # Interactive prompt for uncommitted changes
+        # This shouldn't happen since we check above, but handle it anyway
         output.warning("Uncommitted changes detected in overlay repo:")
         for changed_file in e.changed_files:
             output.info(f"  {changed_file}")
-        if sys.stdin.isatty():
-            try:
-                response = input("Continue anyway? [y/N] ").strip().lower()
-                if response in ("y", "yes"):
-                    # Retry with force=True
-                    try:
-                        unlink_overlay(
-                            root_dir,
-                            remove_repo=remove_repo,
-                            force=True,
-                            dry_run=args.dry_run,
-                            output=output,
-                        )
-                        return 0
-                    except OverlayError as retry_e:
-                        output.error(str(retry_e))
-                        return 1
-            except (EOFError, KeyboardInterrupt):
-                print()  # Newline after ^C
         output.info("Use --force to proceed with uncommitted changes.")
         return 1
     except OverlayError as e:
