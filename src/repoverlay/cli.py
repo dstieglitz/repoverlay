@@ -8,6 +8,8 @@ from .config import ConfigError, find_config, load_config
 from .output import Output, set_output
 from .overlay import (
     OverlayError,
+    UncommittedChangesError,
+    UnpushedCommitsError,
     clone_overlay,
     get_repo_dir,
     sync_overlay,
@@ -77,6 +79,11 @@ def main() -> int:
         "--remove-repo",
         action="store_true",
         help="Also remove .repoverlay/ directory",
+    )
+    unlink_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Proceed even with uncommitted changes",
     )
     unlink_parser.add_argument(
         "--dry-run", "-n",
@@ -242,6 +249,7 @@ def cmd_unlink(args, output: Output) -> int:
 
     root_dir = config_path.parent
     remove_repo = args.remove_repo
+    force = args.force
 
     # If not using --remove-repo and not dry-run, prompt the user
     if not remove_repo and not args.dry_run:
@@ -258,9 +266,39 @@ def cmd_unlink(args, output: Output) -> int:
         unlink_overlay(
             root_dir,
             remove_repo=remove_repo,
+            force=force,
             dry_run=args.dry_run,
             output=output,
         )
+    except UnpushedCommitsError as e:
+        output.error(str(e))
+        return 1
+    except UncommittedChangesError as e:
+        # Interactive prompt for uncommitted changes
+        output.warning("Uncommitted changes detected in overlay repo:")
+        for changed_file in e.changed_files:
+            output.info(f"  {changed_file}")
+        if sys.stdin.isatty():
+            try:
+                response = input("Continue anyway? [y/N] ").strip().lower()
+                if response in ("y", "yes"):
+                    # Retry with force=True
+                    try:
+                        unlink_overlay(
+                            root_dir,
+                            remove_repo=remove_repo,
+                            force=True,
+                            dry_run=args.dry_run,
+                            output=output,
+                        )
+                        return 0
+                    except OverlayError as retry_e:
+                        output.error(str(retry_e))
+                        return 1
+            except (EOFError, KeyboardInterrupt):
+                print()  # Newline after ^C
+        output.info("Use --force to proceed with uncommitted changes.")
+        return 1
     except OverlayError as e:
         output.error(str(e))
         return 1

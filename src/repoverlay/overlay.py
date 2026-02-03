@@ -462,10 +462,27 @@ def _urls_match(url1: str, url2: str) -> bool:
     return normalize(url1) == normalize(url2)
 
 
+class UncommittedChangesError(OverlayError):
+    """Raised when there are uncommitted changes that would be lost."""
+
+    def __init__(self, message: str, changed_files: list[str]):
+        super().__init__(message)
+        self.changed_files = changed_files
+
+
+class UnpushedCommitsError(OverlayError):
+    """Raised when there are unpushed commits that would be lost."""
+
+    def __init__(self, message: str, commit_count: int):
+        super().__init__(message)
+        self.commit_count = commit_count
+
+
 def unlink_overlay(
     root_dir: Path,
     *,
     remove_repo: bool = False,
+    force: bool = False,
     dry_run: bool = False,
     output: Output | None = None,
 ) -> None:
@@ -474,13 +491,39 @@ def unlink_overlay(
     Args:
         root_dir: Root directory of main repo.
         remove_repo: Also remove .repoverlay/ directory
+        force: Proceed even with uncommitted changes
         dry_run: Preview changes without making them
         output: Output handler
+
+    Raises:
+        UnpushedCommitsError: If there are unpushed commits (hard block)
+        UncommittedChangesError: If there are uncommitted changes (unless force=True)
     """
     if output is None:
         output = get_output()
 
     from .exclude import remove_managed_section
+
+    repo_dir = get_repo_dir(root_dir)
+
+    # Pre-unlink validation (only if repo exists - handles resumable unlink case)
+    if repo_dir.exists() and (repo_dir / ".git").exists():
+        # Check for unpushed commits - hard block
+        has_unpushed, commit_count = git.has_unpushed_commits(repo_dir)
+        if has_unpushed:
+            raise UnpushedCommitsError(
+                f"Cannot unlink - there are {commit_count} unpushed commit(s) in the overlay repo.\n"
+                "Run 'repoverlay push' first, or remove the commits with 'git reset'.",
+                commit_count,
+            )
+
+        # Check for uncommitted changes - warn unless force
+        has_uncommitted, changed_files = git.has_uncommitted_changes(repo_dir)
+        if has_uncommitted and not force and not dry_run:
+            raise UncommittedChangesError(
+                "Uncommitted changes detected in overlay repo.",
+                changed_files,
+            )
 
     # Load state
     state = read_state(root_dir)

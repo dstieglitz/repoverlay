@@ -280,3 +280,87 @@ def pull_from(repo_dir: Path, source_repo: Path, branch: str) -> None:
     )
     if result.returncode != 0:
         raise GitError(f"Pull failed: {result.stderr.strip()}")
+
+
+def has_uncommitted_changes(repo_dir: Path) -> tuple[bool, list[str]]:
+    """Check if there are uncommitted changes (staged or unstaged).
+
+    Args:
+        repo_dir: Path to the repository.
+
+    Returns:
+        Tuple of (has_changes, list of changed files)
+    """
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False, []
+
+    output = result.stdout.strip()
+    if not output:
+        return False, []
+
+    # Parse the porcelain output to get file list
+    changed_files = []
+    for line in output.split("\n"):
+        if line:
+            # Format is "XY filename" where XY is the status
+            changed_files.append(line)
+    return True, changed_files
+
+
+def has_unpushed_commits(repo_dir: Path) -> tuple[bool, int]:
+    """Check if there are commits not pushed to remote.
+
+    Args:
+        repo_dir: Path to the repository.
+
+    Returns:
+        Tuple of (has_unpushed, count of unpushed commits)
+    """
+    # First check if there's an upstream configured
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "@{u}"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        # No upstream configured, try to use origin/<branch>
+        branch = get_current_branch(repo_dir)
+        if not branch:
+            return False, 0
+
+        # Check if origin/<branch> exists
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"origin/{branch}"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            # No remote tracking branch, can't determine
+            return False, 0
+
+        upstream = f"origin/{branch}"
+    else:
+        upstream = result.stdout.strip()
+
+    # Count commits ahead of upstream
+    result = subprocess.run(
+        ["git", "rev-list", "--count", f"{upstream}..HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        return False, 0
+
+    count = int(result.stdout.strip())
+    return count > 0, count

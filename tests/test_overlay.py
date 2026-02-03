@@ -1,6 +1,7 @@
 """Tests for overlay module."""
 
 import os
+import subprocess
 
 import pytest
 import yaml
@@ -8,6 +9,8 @@ import yaml
 from repoverlay.output import Output
 from repoverlay.overlay import (
     OverlayError,
+    UncommittedChangesError,
+    UnpushedCommitsError,
     clone_overlay,
     get_overlay_dir,
     get_repo_dir,
@@ -471,3 +474,106 @@ class TestUnlinkOverlay:
         # Everything should still exist
         assert (tmp_main_repo / ".env").exists()
         assert get_overlay_dir(tmp_main_repo).exists()
+
+    def test_unlink_blocks_on_unpushed_commits(self, tmp_main_repo, sample_config):
+        """Unlink fails if there are unpushed commits."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        # Configure git user for commits
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
+
+        # Make an unpushed commit
+        (repo_dir / "new_file.txt").write_text("new content")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "unpushed commit"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+        )
+
+        output = Output(quiet=True)
+        with pytest.raises(UnpushedCommitsError, match="unpushed commit"):
+            unlink_overlay(tmp_main_repo, output=output)
+
+    def test_unlink_warns_on_uncommitted_changes(self, tmp_main_repo, sample_config):
+        """Unlink warns if there are uncommitted changes."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        # Create uncommitted changes
+        (repo_dir / "untracked.txt").write_text("untracked content")
+
+        output = Output(quiet=True)
+        with pytest.raises(UncommittedChangesError, match="Uncommitted changes"):
+            unlink_overlay(tmp_main_repo, output=output)
+
+    def test_unlink_force_bypasses_uncommitted_warning(self, tmp_main_repo, sample_config):
+        """Unlink with force bypasses uncommitted changes warning."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        # Create uncommitted changes
+        (repo_dir / "untracked.txt").write_text("untracked content")
+
+        output = Output(quiet=True)
+        # Should not raise with force=True
+        unlink_overlay(tmp_main_repo, force=True, output=output)
+
+        # Symlinks should be removed
+        assert not (tmp_main_repo / ".env").exists()
+
+    def test_unlink_resumable_when_repo_missing(self, tmp_main_repo, sample_config):
+        """Unlink can resume when repo is already removed but state exists."""
+        import shutil
+
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Simulate interrupted unlink - remove repo but keep state
+        repo_dir = get_repo_dir(tmp_main_repo)
+        shutil.rmtree(repo_dir)
+
+        # State should still have symlinks
+        state = read_state(tmp_main_repo)
+        assert len(state.get("symlinks", [])) > 0
+
+        # Symlinks still exist
+        assert (tmp_main_repo / ".env").is_symlink()
+
+        output = Output(quiet=True)
+        # Should not raise, should continue cleaning up
+        unlink_overlay(tmp_main_repo, output=output)
+
+        # Symlinks should now be removed
+        assert not (tmp_main_repo / ".env").exists()
+
+    def test_unlink_dry_run_skips_validation(self, tmp_main_repo, sample_config):
+        """Unlink dry run doesn't fail on uncommitted changes."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        # Create uncommitted changes
+        (repo_dir / "untracked.txt").write_text("untracked content")
+
+        output = Output(quiet=True)
+        # Should not raise with dry_run=True
+        unlink_overlay(tmp_main_repo, dry_run=True, output=output)
+
+        # Everything should still exist
+        assert (tmp_main_repo / ".env").exists()
