@@ -91,6 +91,7 @@ def main() -> int:
     subparsers.add_parser("push", help="Push overlay repo changes")
 
     commit_parser = subparsers.add_parser("commit", help="Commit changes in overlay repo")
+    commit_parser.add_argument("-a", "--all", action="store_true", help="Automatically stage modified/deleted files")
     commit_parser.add_argument("-m", "--message", help="Commit message")
     commit_parser.add_argument("args", nargs="*", help="Additional git commit arguments")
 
@@ -320,18 +321,82 @@ def cmd_pull(output: Output) -> int:
         return 1
 
 
+def _is_local_path(repo: str) -> bool:
+    """Check if repo is a local path rather than a git URL."""
+    if "://" in repo or (repo.startswith("git@") and ":" in repo):
+        return False
+    return True
+
+
 def cmd_push(output: Output) -> int:
     """Execute git push in overlay repo."""
     result = _get_repo_dir_or_error(output)
     if result is None:
         return 1
-    repo_dir, _ = result
+    repo_dir, root_dir = result
 
+    # Get the remote URL to check if it's a local non-bare repo
+    try:
+        remote_url = git.get_remote_url(repo_dir)
+    except git.GitError:
+        # No remote configured, just try pushing
+        try:
+            git.push(repo_dir)
+            output.success("Push complete.")
+            return 0
+        except git.GitError as e:
+            output.error(str(e))
+            return 1
+
+    # Check if remote is a local path
+    if _is_local_path(remote_url):
+        from pathlib import Path
+        remote_path = Path(remote_url)
+        if not remote_path.is_absolute():
+            remote_path = (repo_dir / remote_url).resolve()
+
+        if remote_path.exists() and remote_path.is_dir():
+            # Check if it's a non-bare repo
+            if not git.is_bare_repo(remote_path):
+                # Get the branch we're trying to push
+                local_branch = git.get_current_branch(repo_dir)
+                remote_branch = git.get_current_branch(remote_path)
+
+                if local_branch and remote_branch and local_branch == remote_branch:
+                    # The remote has the same branch checked out - use pull instead
+                    output.info(f"Remote is a local non-bare repo with '{remote_branch}' checked out.")
+                    output.info("Pulling changes into remote to keep working directory in sync...")
+                    try:
+                        git.pull_from(remote_path, repo_dir, local_branch)
+                        # Fetch to update our remote tracking refs so status shows correct state
+                        git.fetch(repo_dir)
+                        output.success("Push complete (via pull into remote).")
+                        return 0
+                    except git.GitError as e:
+                        output.error(f"Failed to sync changes: {e}")
+                        output.info("")
+                        output.info("Manual steps to resolve:")
+                        output.info(f"  1. cd {remote_path}")
+                        output.info(f"  2. git pull {repo_dir} {local_branch}")
+                        return 1
+
+    # Standard push for remote URLs or bare repos
     try:
         git.push(repo_dir)
         output.success("Push complete.")
         return 0
     except git.GitError as e:
+        # Check if error is due to pushing to checked-out branch
+        error_msg = str(e)
+        if "refusing to update checked out branch" in error_msg or "branch is currently checked out" in error_msg:
+            output.error("Cannot push to a non-bare repository with the target branch checked out.")
+            output.info("")
+            output.info("Manual steps to resolve:")
+            output.info(f"  1. cd {remote_url}")
+            output.info(f"  2. git pull {repo_dir} <branch>")
+            output.info("")
+            output.info("Or convert the remote to a bare repository.")
+            return 1
         output.error(str(e))
         return 1
 
@@ -344,7 +409,12 @@ def cmd_commit(args, output: Output) -> int:
     repo_dir, _ = result
 
     try:
-        git.commit(repo_dir, message=args.message, args=args.args if args.args else None)
+        extra_args = []
+        if args.all:
+            extra_args.append("-a")
+        if args.args:
+            extra_args.extend(args.args)
+        git.commit(repo_dir, message=args.message, args=extra_args if extra_args else None)
         output.success("Commit complete.")
         return 0
     except git.GitError as e:

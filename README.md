@@ -169,9 +169,24 @@ Run git commands in the overlay repository:
 | `repoverlay push` | Push overlay changes |
 | `repoverlay diff [args]` | Show overlay diff |
 | `repoverlay add <files>` | Stage files in overlay |
-| `repoverlay commit -m "msg"` | Commit overlay changes |
+| `repoverlay commit [-a] -m "msg"` | Commit overlay changes (`-a` stages modified files) |
 | `repoverlay checkout <ref>` | Checkout ref, then sync symlinks |
 | `repoverlay merge <branch>` | Merge branch, then sync symlinks |
+
+#### Push to Local Repositories
+
+When your overlay points to a local non-bare repository (a normal working directory rather than a bare `.git` repo), `repoverlay push` automatically handles the complexity of pushing to a checked-out branch.
+
+Instead of failing with git's "refusing to update checked out branch" error, repoverlay detects this situation and uses a pull-based sync:
+
+```bash
+$ repoverlay push
+Remote is a local non-bare repo with 'main' checked out.
+Pulling changes into remote to keep working directory in sync...
+Push complete (via pull into remote).
+```
+
+This keeps both the overlay clone and the origin repository in sync, with working directories updated correctly.
 
 ### Global Flags
 
@@ -395,6 +410,7 @@ When using a local directory:
 - If the path is a plain directory, it will be copied
 - For plain directories, the `ref` field is ignored
 - Use `repoverlay sync` if you add new files to the mappings
+- `repoverlay push` works transparently—it detects local non-bare repos and syncs changes correctly
 
 ## Development
 

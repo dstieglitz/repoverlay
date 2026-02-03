@@ -218,3 +218,65 @@ def merge(repo_dir: Path, branch: str | None = None) -> None:
     if branch:
         cmd.append(branch)
     run_git(repo_dir, cmd, capture=True)
+
+
+def is_bare_repo(repo_dir: Path) -> bool:
+    """Check if a repository is bare.
+
+    Args:
+        repo_dir: Path to the repository.
+
+    Returns:
+        True if the repository is bare, False otherwise.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-bare-repository"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def get_current_branch(repo_dir: Path) -> str | None:
+    """Get the currently checked out branch.
+
+    Args:
+        repo_dir: Path to the repository.
+
+    Returns:
+        Branch name, or None if in detached HEAD state or not a git repo.
+    """
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    return branch if branch else None
+
+
+def pull_from(repo_dir: Path, source_repo: Path, branch: str) -> None:
+    """Pull changes from a source repository into this repository.
+
+    This is used to sync changes from an overlay repo into a local non-bare origin.
+
+    Args:
+        repo_dir: Path to the repository to pull into.
+        source_repo: Path to the source repository to pull from.
+        branch: Branch to pull.
+
+    Raises:
+        GitError: If pull fails.
+    """
+    result = subprocess.run(
+        ["git", "pull", str(source_repo), branch],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise GitError(f"Pull failed: {result.stderr.strip()}")

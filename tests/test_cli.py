@@ -385,3 +385,129 @@ class TestExitCode2:
         )
         assert result.returncode == 2
         assert ".gitignore" in result.stderr.lower() or "warning" in result.stderr.lower()
+
+
+class TestCommitCommand:
+    """Tests for commit command."""
+
+    def test_commit_with_all_flag(self, tmp_main_repo, sample_config):
+        """Commit -a stages and commits modified files."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Modify a file in the overlay repo (repo is in .repoverlay/repo/)
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        secrets_file = repo_dir / "secrets" / "db.yaml"
+        secrets_file.write_text("password: new_secret")
+
+        # Commit with -a flag (should auto-stage the modified file)
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "-a", "-m", "update secret"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "complete" in result.stdout.lower()
+
+        # Verify the commit was made
+        log_result = subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "update secret" in log_result.stdout
+
+    def test_commit_all_flag_long_form(self, tmp_main_repo, sample_config):
+        """Commit --all stages and commits modified files."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Modify a file in the overlay repo (repo is in .repoverlay/repo/)
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        secrets_file = repo_dir / "secrets" / "db.yaml"
+        secrets_file.write_text("password: another_secret")
+
+        # Commit with --all flag
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "--all", "-m", "another update"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "complete" in result.stdout.lower()
+
+    def test_push_to_local_nonbare_repo(self, tmp_main_repo, tmp_overlay_repo):
+        """Push to local non-bare repo works via pull mechanism."""
+        # tmp_overlay_repo is a non-bare repo (has working directory)
+        # Configure repoverlay to use it
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo),
+                "mappings": [
+                    {"src": "secrets", "dst": "config/secrets"},
+                ],
+            },
+        }
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Modify a file in the overlay repo
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        secrets_file = repo_dir / "secrets" / "db.yaml"
+        secrets_file.write_text("password: pushed_secret")
+
+        # Commit the change
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "-a", "-m", "test push"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Push should succeed (via pull into remote)
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "push"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "complete" in result.stdout.lower()
+
+        # Verify the change was pushed to the origin repo
+        origin_file = tmp_overlay_repo / "secrets" / "db.yaml"
+        assert origin_file.read_text() == "password: pushed_secret"
+
+        # Verify status doesn't show unpushed commits (tracking refs updated)
+        status_result = subprocess.run(
+            ["git", "status", "-sb"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        # Should not show "ahead" if tracking refs are properly updated
+        assert "ahead" not in status_result.stdout
