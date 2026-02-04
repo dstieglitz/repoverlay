@@ -199,13 +199,35 @@ class TestCloneOverlay:
         with pytest.raises(OverlayError, match="Source not found in overlay"):
             clone_overlay(tmp_main_repo, sample_config)
 
-    def test_error_if_destination_exists(self, tmp_main_repo, sample_config):
-        """Error if destination already exists."""
+    def test_skips_if_destination_exists(self, tmp_main_repo, sample_config, capsys):
+        """Skips files if destination already exists (with warning)."""
         # Create the destination file first
         (tmp_main_repo / ".env").write_text("existing")
 
-        with pytest.raises(OverlayError, match="Destination already exists"):
-            clone_overlay(tmp_main_repo, sample_config)
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # The existing file should be preserved (not overwritten)
+        assert (tmp_main_repo / ".env").read_text() == "existing"
+        # It should NOT be a symlink
+        assert not (tmp_main_repo / ".env").is_symlink()
+        # Other symlinks should still be created
+        assert (tmp_main_repo / "config" / "secrets").is_symlink()
+
+        # Check state doesn't include skipped file
+        state = read_state(tmp_main_repo)
+        assert ".env" not in state["symlinks"]
+        assert "config/secrets" in state["symlinks"]
+
+    def test_force_overwrites_existing(self, tmp_main_repo, sample_config):
+        """Force flag overwrites existing destination files."""
+        # Create the destination file first
+        (tmp_main_repo / ".env").write_text("existing")
+
+        clone_overlay(tmp_main_repo, sample_config, force=True)
+
+        # The file should now be a symlink with overlay content
+        assert (tmp_main_repo / ".env").is_symlink()
+        assert (tmp_main_repo / ".env").read_text() == "API_KEY=xxx"
 
     def test_checkout_ref(self, tmp_main_repo, tmp_overlay_repo, sample_config):
         """Checkout specific ref if specified."""
@@ -416,6 +438,57 @@ class TestSyncOverlay:
         sync_overlay(tmp_main_repo, config, output=output)
 
         assert (tmp_main_repo / "app.conf").is_symlink()
+
+    def test_sync_skips_existing_files(self, tmp_main_repo, tmp_overlay_repo, sample_config):
+        """Sync skips files where destination already exists."""
+        output = Output(quiet=True)
+        clone_overlay(tmp_main_repo, sample_config, output=output)
+
+        # Add a new file to the cloned overlay repo
+        repo_dir = get_repo_dir(tmp_main_repo)
+        (repo_dir / "new.txt").write_text("new content")
+
+        # Create a conflicting file in main repo
+        (tmp_main_repo / "conflict.txt").write_text("existing content")
+
+        # Add both to config
+        sample_config["overlay"]["mappings"].append(
+            {"src": "new.txt", "dst": "new.txt"}
+        )
+        sample_config["overlay"]["mappings"].append(
+            {"src": "new.txt", "dst": "conflict.txt"}
+        )
+
+        sync_overlay(tmp_main_repo, sample_config, output=output)
+
+        # new.txt should be symlinked
+        assert (tmp_main_repo / "new.txt").is_symlink()
+        # conflict.txt should be preserved (not a symlink)
+        assert not (tmp_main_repo / "conflict.txt").is_symlink()
+        assert (tmp_main_repo / "conflict.txt").read_text() == "existing content"
+
+    def test_sync_force_overwrites_existing(self, tmp_main_repo, tmp_overlay_repo, sample_config):
+        """Sync with force overwrites existing files."""
+        output = Output(quiet=True)
+        clone_overlay(tmp_main_repo, sample_config, output=output)
+
+        # Add a new file to the cloned overlay repo
+        repo_dir = get_repo_dir(tmp_main_repo)
+        (repo_dir / "new.txt").write_text("overlay content")
+
+        # Create a conflicting file in main repo
+        (tmp_main_repo / "conflict.txt").write_text("existing content")
+
+        # Add mapping for the conflict
+        sample_config["overlay"]["mappings"].append(
+            {"src": "new.txt", "dst": "conflict.txt"}
+        )
+
+        sync_overlay(tmp_main_repo, sample_config, force=True, output=output)
+
+        # conflict.txt should now be a symlink with overlay content
+        assert (tmp_main_repo / "conflict.txt").is_symlink()
+        assert (tmp_main_repo / "conflict.txt").read_text() == "overlay content"
 
 
 class TestUnlinkOverlay:

@@ -258,7 +258,7 @@ def clone_overlay(
     mappings = filter_mappings(mappings, ignore_patterns)
 
     # Create symlinks for regular files
-    symlinks_created, dirs_created = _create_symlinks(root_dir, repo_dir, mappings, output, force=force)
+    symlinks_created, dirs_created, skipped = _create_symlinks(root_dir, repo_dir, mappings, output, force=force)
 
     # Create symlinks for decoded (encrypted) files
     if encrypted_files:
@@ -279,7 +279,9 @@ def clone_overlay(
                     else:
                         shutil.rmtree(dst_path)
                 else:
-                    raise OverlayError(f"Destination already exists: {dst_path}")
+                    # Skip existing files with a warning instead of erroring
+                    output.warning(f"Skipping {dst} - destination already exists (use --force to overwrite)")
+                    continue
 
             # Create parent directories if needed
             parent = dst_path.parent
@@ -492,7 +494,7 @@ def sync_overlay(
             output.removed(dst)
 
     # Create new symlinks
-    symlinks_created, dirs_created = _create_symlinks(
+    symlinks_created, dirs_created, skipped = _create_symlinks(
         root_dir, repo_dir, to_create, output, force=force
     )
 
@@ -530,7 +532,7 @@ def sync_overlay(
                 else:
                     shutil.rmtree(dst_path)
             else:
-                output.warning(f"Cannot create symlink, destination exists: {symlink_dst}")
+                output.warning(f"Skipping {symlink_dst} - destination already exists (use --force to overwrite)")
                 continue
 
         # Create parent directories if needed
@@ -577,7 +579,7 @@ def _create_symlinks(
     output: Output,
     *,
     force: bool = False,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Create symlinks for mappings.
 
     Args:
@@ -588,13 +590,14 @@ def _create_symlinks(
         force: Overwrite existing destinations
 
     Returns:
-        Tuple of (symlinks_created, directories_created)
+        Tuple of (symlinks_created, directories_created, skipped_files)
 
     Raises:
         OverlayError: If operation fails
     """
     symlinks_created = []
     dirs_created = []
+    skipped = []
 
     for mapping in mappings:
         src = mapping["src"]
@@ -618,7 +621,10 @@ def _create_symlinks(
                     import shutil
                     shutil.rmtree(dst_path)
             else:
-                raise OverlayError(f"Destination already exists: {dst_path}")
+                # Skip existing files with a warning instead of erroring
+                output.warning(f"Skipping {dst} - destination already exists (use --force to overwrite)")
+                skipped.append(dst)
+                continue
 
         # Create parent directories if needed
         parent = dst_path.parent
@@ -641,7 +647,7 @@ def _create_symlinks(
         symlinks_created.append(dst)
         output.created(dst)
 
-    return symlinks_created, dirs_created
+    return symlinks_created, dirs_created, skipped
 
 
 def _urls_match(url1: str, url2: str) -> bool:

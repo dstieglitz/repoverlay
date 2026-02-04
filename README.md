@@ -128,9 +128,11 @@ repoverlay clone [--force] [--dry-run]
 
 | Flag | Description |
 |------|-------------|
-| `--force`, `-f` | Overwrite existing `.repoverlay/repo/` and destinations |
+| `--force`, `-f` | Overwrite existing `.repoverlay/repo/` and destination files |
 | `--dry-run`, `-n` | Preview changes without executing |
 | `--intellij` | Configure IntelliJ IDEA to track overlay repo as VCS root |
+
+Files that already exist in your project are skipped with a warning. Use `--force` to overwrite them.
 
 ### `repoverlay sync`
 
@@ -142,9 +144,11 @@ repoverlay sync [--force] [--dry-run]
 
 | Flag | Description |
 |------|-------------|
-| `--force`, `-f` | Overwrite existing destinations |
+| `--force`, `-f` | Overwrite existing destination files |
 | `--dry-run`, `-n` | Preview changes without executing |
 | `--intellij` | Configure IntelliJ IDEA to track overlay repo as VCS root |
+
+Files that already exist in your project are skipped with a warning. Use `--force` to overwrite them.
 
 ### `repoverlay unlink`
 
@@ -274,6 +278,23 @@ README.md
 - `[seq]` matches any character in seq
 - Lines starting with `#` are comments
 - Blank lines are ignored
+
+## Conflict Handling
+
+When a destination file already exists in your main repository (e.g., both repos have a `README.md`), repoverlay **skips** that file with a warning instead of failing:
+
+```
+Warning: Skipping README.md - destination already exists (use --force to overwrite)
+```
+
+This allows you to:
+- Keep your main repo's version of common files like `README.md`
+- Overlay only the files that don't conflict
+- Use `--force` to overwrite if you want the overlay version
+
+**Skipped files are not tracked** in repoverlay's state, so they won't be removed by `unlink` or managed by `sync`.
+
+If you want to explicitly exclude certain overlay files (rather than relying on conflicts), add them to `.repoverlayignore`.
 
 ## Path Validation
 
