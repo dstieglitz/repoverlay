@@ -3,8 +3,9 @@
 import argparse
 import sys
 
-from . import __version__, git
+from . import __version__, git, sops
 from .config import ConfigError, find_config, load_config
+from .ignore import matches_any_pattern
 from .output import Output, set_output
 from .intellij import configure_vcs_root, remove_vcs_root
 from .overlay import (
@@ -12,10 +13,12 @@ from .overlay import (
     UncommittedChangesError,
     UnpushedCommitsError,
     clone_overlay,
+    get_decoded_dir,
     get_repo_dir,
     sync_overlay,
     unlink_overlay,
 )
+from .state import read_state, write_state
 
 
 def main() -> int:
@@ -115,6 +118,11 @@ def main() -> int:
 
     add_parser = subparsers.add_parser("add", help="Add files to overlay repo staging")
     add_parser.add_argument("files", nargs="+", help="Files to add")
+    add_parser.add_argument(
+        "--encrypt", "-e",
+        action="store_true",
+        help="Encrypt files with SOPS before adding (creates .enc files)",
+    )
 
     diff_parser = subparsers.add_parser("diff", help="Show diff in overlay repo")
     diff_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git diff arguments")
@@ -478,11 +486,53 @@ def cmd_push(output: Output) -> int:
 
 
 def cmd_commit(args, output: Output) -> int:
-    """Execute git commit in overlay repo."""
+    """Execute git commit in overlay repo.
+
+    Before committing, checks for changes to decoded (SOPS-decrypted) files
+    and re-encrypts them.
+    """
     result = _get_repo_dir_or_error(output)
     if result is None:
         return 1
-    repo_dir, _ = result
+    repo_dir, root_dir = result
+
+    # Load config to get sops_config path
+    cfg_result = _get_config_and_root(output)
+    config = cfg_result[0] if cfg_result else None
+
+    # Check for changes to decoded files and re-encrypt
+    state = read_state(root_dir)
+    encrypted_files = state.get("encrypted_files", {})
+
+    if encrypted_files:
+        decoded_dir = get_decoded_dir(root_dir)
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+
+        try:
+            # Detect which decoded files have changed
+            changed = sops.detect_decoded_changes(
+                decoded_dir, repo_dir, encrypted_files, sops_config
+            )
+
+            if changed:
+                output.info(f"Re-encrypting {len(changed)} modified file(s)...")
+                # Re-encrypt changed files
+                updated = sops.re_encrypt_changed_files(
+                    decoded_dir, repo_dir, changed, encrypted_files, sops_config
+                )
+
+                if updated:
+                    # Stage re-encrypted files
+                    git.add(repo_dir, updated)
+                    output.info(f"Staged {len(updated)} re-encrypted file(s)")
+
+                    # Update state with new hashes
+                    write_state(root_dir, state)
+
+        except sops.SopsError as e:
+            output.error(f"Failed to re-encrypt files: {e}")
+            output.info("Commit aborted to prevent stale encrypted files.")
+            return 1
 
     try:
         extra_args = []
@@ -499,19 +549,136 @@ def cmd_commit(args, output: Output) -> int:
 
 
 def cmd_add(args, output: Output) -> int:
-    """Execute git add in overlay repo."""
+    """Execute git add in overlay repo.
+
+    With --encrypt flag or when files match encrypt_patterns in config,
+    files are encrypted with SOPS before being added.
+    """
     result = _get_repo_dir_or_error(output)
     if result is None:
         return 1
-    repo_dir, _ = result
+    repo_dir, root_dir = result
 
-    try:
-        git.add(repo_dir, args.files)
-        output.success("Files staged.")
-        return 0
-    except git.GitError as e:
-        output.error(str(e))
-        return 1
+    # Load config for encrypt_patterns
+    cfg_result = _get_config_and_root(output)
+    config = cfg_result[0] if cfg_result else None
+    encrypt_patterns = []
+    if config and "overlay" in config:
+        encrypt_patterns = config["overlay"].get("encrypt_patterns", [])
+
+    # Determine which files should be encrypted
+    files_to_encrypt = []
+    files_to_add_plain = []
+
+    for file_path in args.files:
+        should_encrypt = args.encrypt
+
+        # Check against encrypt_patterns if not already flagged
+        if not should_encrypt and encrypt_patterns:
+            # Get relative path from repo_dir
+            from pathlib import Path
+            abs_path = Path(file_path).resolve()
+            try:
+                rel_path = abs_path.relative_to(repo_dir)
+                if matches_any_pattern(str(rel_path), encrypt_patterns):
+                    should_encrypt = True
+            except ValueError:
+                # Path is not relative to repo_dir, check the raw path
+                if matches_any_pattern(file_path, encrypt_patterns):
+                    should_encrypt = True
+
+        if should_encrypt:
+            files_to_encrypt.append(file_path)
+        else:
+            files_to_add_plain.append(file_path)
+
+    # Handle files that need encryption
+    if files_to_encrypt:
+        if not sops.is_sops_available():
+            output.error(
+                "SOPS is not installed. Install it with:\n"
+                "  brew install sops      # macOS\n"
+                "  apt install sops       # Debian/Ubuntu\n"
+                "  choco install sops     # Windows"
+            )
+            return 1
+
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+        decoded_dir = get_decoded_dir(root_dir)
+        state = read_state(root_dir)
+        encrypted_files = state.get("encrypted_files", {})
+
+        from pathlib import Path
+        encrypted_paths = []
+
+        for file_path in files_to_encrypt:
+            src_path = Path(file_path)
+            if not src_path.is_absolute():
+                src_path = Path.cwd() / file_path
+            src_path = src_path.resolve()
+
+            if not src_path.exists():
+                output.error(f"File not found: {file_path}")
+                return 1
+
+            # Determine the encrypted filename and paths
+            try:
+                rel_path = src_path.relative_to(repo_dir)
+            except ValueError:
+                # File is outside repo_dir, use basename
+                rel_path = Path(src_path.name)
+
+            enc_filename = str(rel_path) + ".enc"
+            enc_dst = repo_dir / enc_filename
+            decoded_dst = decoded_dir / rel_path
+
+            try:
+                # Encrypt the file
+                sops.encrypt_file(src_path, enc_dst, sops_config)
+                output.info(f"Encrypted: {output.path(enc_filename)}")
+
+                # Copy plaintext to decoded dir
+                decoded_dst.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy2(src_path, decoded_dst)
+
+                # Update state
+                encrypted_files[enc_filename] = {
+                    "decoded_path": str(rel_path),
+                    "symlink_dst": str(rel_path),
+                    "last_encrypted_hash": sops.file_hash(enc_dst),
+                }
+                encrypted_paths.append(enc_filename)
+
+            except sops.SopsError as e:
+                output.error(f"Failed to encrypt {file_path}: {e}")
+                return 1
+
+        # Stage encrypted files
+        if encrypted_paths:
+            try:
+                git.add(repo_dir, encrypted_paths)
+                output.info(f"Staged {len(encrypted_paths)} encrypted file(s)")
+            except git.GitError as e:
+                output.error(str(e))
+                return 1
+
+        # Update state
+        state["encrypted_files"] = encrypted_files
+        write_state(root_dir, state)
+
+    # Handle plain files
+    if files_to_add_plain:
+        try:
+            git.add(repo_dir, files_to_add_plain)
+            output.success("Files staged.")
+        except git.GitError as e:
+            output.error(str(e))
+            return 1
+    elif files_to_encrypt:
+        output.success("Files encrypted and staged.")
+
+    return 0
 
 
 def cmd_diff(args, output: Output) -> int:

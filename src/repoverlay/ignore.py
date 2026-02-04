@@ -135,3 +135,19 @@ def filter_mappings(
         Filtered list of mappings (those not ignored)
     """
     return [m for m in mappings if not should_ignore(m["src"], patterns)]
+
+
+def matches_any_pattern(path: str, patterns: list[str]) -> bool:
+    """Check if a path matches any of the given patterns.
+
+    This is the inverse of should_ignore - returns True if the path
+    matches any pattern. Useful for checking encrypt_patterns.
+
+    Args:
+        path: Path to check (relative path)
+        patterns: List of glob patterns
+
+    Returns:
+        True if path matches any pattern
+    """
+    return should_ignore(path, patterns)

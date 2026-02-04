@@ -170,7 +170,7 @@ Run git commands in the overlay repository:
 | `repoverlay pull` | Pull updates, then sync symlinks |
 | `repoverlay push` | Push overlay changes |
 | `repoverlay diff [args]` | Show overlay diff |
-| `repoverlay add <files>` | Stage files in overlay |
+| `repoverlay add [-e] <files>` | Stage files in overlay (`-e`/`--encrypt` to encrypt with SOPS) |
 | `repoverlay commit [-a] -m "msg"` | Commit overlay changes (`-a` stages modified files) |
 | `repoverlay checkout <ref>` | Checkout ref, then sync symlinks |
 | `repoverlay merge <branch>` | Merge branch, then sync symlinks |
@@ -221,6 +221,8 @@ overlay:
 | `overlay.repo` | Yes | Git URL or local path of overlay repository |
 | `overlay.ref` | No | Branch, tag, or commit to checkout |
 | `overlay.mappings` | No | List of source/destination mappings. If omitted, all files in the overlay are symlinked using their original paths |
+| `overlay.sops_config` | No | Path to `.sops.yaml` in overlay repo (default: `.config/.sops.yaml` or `.sops.yaml`) |
+| `overlay.encrypt_patterns` | No | List of glob patterns for auto-encrypting files on `repoverlay add` |
 | `mappings[].src` | Yes | Path in overlay repo |
 | `mappings[].dst` | Yes | Path in main repo (must be relative) |
 
@@ -364,23 +366,130 @@ repoverlay pull    # Get latest config changes
 # Switch environments by changing .repoverlay.yaml to point to config-staging
 ```
 
-## Example: SOPS for Sensitive Values
+## SOPS Integration
 
-Combine repoverlay with [SOPS](https://github.com/getsops/sops) when configuration contains secrets:
+repoverlay has built-in support for [SOPS](https://github.com/getsops/sops) encrypted files. Files ending in `.enc`, `.encoded`, or `.encrypted` are automatically detected, decrypted to a working directory, and symlinked as plaintext files. Changes are automatically re-encrypted on commit.
+
+### How It Works
+
+```
+main-repo/
+├── .repoverlay.yaml
+├── .repoverlay/
+│   ├── repo/                  # Cloned overlay (encrypted files)
+│   │   ├── .config/
+│   │   │   └── .sops.yaml     # SOPS configuration
+│   │   └── secrets.yaml.enc   # Encrypted file
+│   ├── decoded/               # Decrypted working copies
+│   │   └── secrets.yaml       # Plaintext (git-ignored)
+│   └── state.json
+└── config/secrets.yaml -> ../.repoverlay/decoded/secrets.yaml
+```
+
+### Setup
+
+1. **Install SOPS:**
+   ```bash
+   brew install sops      # macOS
+   apt install sops       # Debian/Ubuntu
+   ```
+
+2. **Add `.sops.yaml` to your overlay repo** (in `.config/.sops.yaml` or root):
+   ```yaml
+   creation_rules:
+     - path_regex: .*\.enc$
+       kms: arn:aws:kms:us-west-2:123456789:key/abc-123
+     # Or use age, pgp, etc.
+     - path_regex: .*\.encrypted$
+       age: age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+
+3. **Clone with automatic decryption:**
+   ```bash
+   repoverlay clone
+   # Output:
+   # Found SOPS config: .config/.sops.yaml
+   # Decrypting SOPS-encrypted files...
+   # Decrypted 2 file(s)
+   #   + secrets.yaml (decrypted)
+   ```
+
+### Encrypting Files
+
+**Option 1: Use `--encrypt` flag:**
+```bash
+repoverlay add --encrypt path/to/secrets.yaml
+```
+
+This will:
+- Encrypt the file → `secrets.yaml.enc` in `.repoverlay/repo/`
+- Copy plaintext to `.repoverlay/decoded/`
+- Stage the encrypted file for commit
+
+**Option 2: Configure auto-encryption patterns:**
+```yaml
+version: 1
+overlay:
+  repo: git@github.com:org/config.git
+  sops_config: .config/.sops.yaml    # optional custom path
+  encrypt_patterns:
+    - "secrets/**"
+    - "**/*.secret.yaml"
+```
+
+Files matching these patterns are automatically encrypted when added:
+```bash
+repoverlay add secrets/database.yaml  # auto-encrypted
+```
+
+### Workflow
 
 ```bash
-# Config repo has encrypted files
-# config-prod/terraform.tfvars.enc (contains DB passwords, API keys)
-
-# Decrypt after clone
+# Clone - encrypted files are decrypted automatically
 repoverlay clone
-sops -d terraform/terraform.tfvars.enc > terraform/terraform.tfvars
 
-# Edit and re-encrypt
-sops terraform/terraform.tfvars.enc
-repoverlay commit -m "Rotate database credentials"
+# Edit the decrypted file directly
+vim config/secrets.yaml
+
+# Commit - changes are re-encrypted automatically
+repoverlay commit -m "Update database password"
+
+# Push encrypted files to remote
 repoverlay push
+
+# Pull - updated encrypted files are re-decrypted
+repoverlay pull
 ```
+
+### Multiple Keys
+
+Different files can use different encryption keys. SOPS stores key metadata inside each encrypted file, so it automatically uses the correct key for decryption. Your `.sops.yaml` creation rules determine which key is used when *encrypting* new files:
+
+```yaml
+creation_rules:
+  - path_regex: terraform/.*\.enc$
+    kms: arn:aws:kms:us-west-2:123:key/terraform-key
+  - path_regex: ansible/.*\.enc$
+    age: age1xxxxxxxxx
+  - path_regex: .*
+    pgp: FINGERPRINT
+```
+
+### Troubleshooting
+
+If decryption fails, repoverlay shows the SOPS error with a hint:
+
+```
+Warning: Cannot decrypt secrets.yaml.enc:
+Failed to decrypt secrets.yaml.enc:
+Error decrypting key: AccessDeniedException...
+Hint: Are you using the correct credentials/profile?
+```
+
+Common issues:
+- **Wrong AWS profile:** `AWS_PROFILE=myprofile repoverlay sync`
+- **Missing age key:** Ensure `SOPS_AGE_KEY_FILE` is set or key is in `~/.config/sops/age/keys.txt`
+- **No matching creation rules:** Check `.sops.yaml` path patterns match your files
 
 ## Example: Local Directory Overlay
 

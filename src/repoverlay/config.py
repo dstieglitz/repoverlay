@@ -118,4 +118,21 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             if dst.startswith("/"):
                 raise ConfigError(f"Destination must be relative: {dst}")
 
+    # Validate sops_config (optional string, relative path)
+    if "sops_config" in overlay:
+        sops_config = overlay["sops_config"]
+        if not isinstance(sops_config, str):
+            raise ConfigError("Invalid config: sops_config must be a string")
+        if sops_config.startswith("/"):
+            raise ConfigError(f"sops_config must be relative path: {sops_config}")
+
+    # Validate encrypt_patterns (optional list of glob strings)
+    if "encrypt_patterns" in overlay:
+        encrypt_patterns = overlay["encrypt_patterns"]
+        if not isinstance(encrypt_patterns, list):
+            raise ConfigError("Invalid config: encrypt_patterns must be a list")
+        for i, pattern in enumerate(encrypt_patterns):
+            if not isinstance(pattern, str):
+                raise ConfigError(f"Invalid encrypt_patterns[{i}]: must be a string")
+
     return config

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from . import git
+from . import sops
 from .exclude import update_exclude_file
 from .ignore import filter_mappings, load_ignore_patterns
 from .output import Output, get_output
@@ -43,6 +44,20 @@ def get_repo_dir(root_dir: Path) -> Path:
     return get_overlay_dir(root_dir) / "repo"
 
 
+def get_decoded_dir(root_dir: Path) -> Path:
+    """Get path to decoded files directory.
+
+    This is where SOPS-decrypted files are stored.
+
+    Args:
+        root_dir: Root directory of main repo.
+
+    Returns:
+        Path to .repoverlay/decoded/
+    """
+    return get_overlay_dir(root_dir) / "decoded"
+
+
 def _is_local_path(repo: str) -> bool:
     """Check if repo is a local path rather than a git URL.
 
@@ -59,27 +74,43 @@ def _is_local_path(repo: str) -> bool:
     return True
 
 
-def _generate_mappings_from_repo(repo_dir: Path) -> list[dict]:
+def _generate_mappings_from_repo(
+    repo_dir: Path,
+    encrypted_files: dict[str, dict[str, str]] | None = None,
+    exclude_paths: set[str] | None = None,
+) -> list[dict]:
     """Generate mappings from all files in a repository.
 
     Creates mappings where src and dst are the same path for each file.
+    For encrypted files, maps to decoded versions instead.
 
     Args:
         repo_dir: Path to the overlay repository
+        encrypted_files: Optional dict of encrypted file metadata from SOPS decryption
+        exclude_paths: Optional set of paths to exclude from mappings
 
     Returns:
         List of mapping dicts with src/dst keys
     """
     mappings = []
+    encrypted_files = encrypted_files or {}
+    exclude_paths = exclude_paths or set()
+
     for path in repo_dir.rglob("*"):
         # Skip directories (we only link files, not dirs directly)
-        # Also skip .git directory
+        # Also skip .git directory and .config directory (holds .sops.yaml)
         if path.is_dir():
             continue
         rel_path = path.relative_to(repo_dir)
-        if rel_path.parts[0] == ".git":
+        if rel_path.parts[0] in (".git", ".config"):
             continue
         path_str = str(rel_path)
+
+        # For encrypted files, don't create mappings - they're handled separately
+        # as symlinks to decoded files
+        if path_str in encrypted_files or path_str in exclude_paths:
+            continue
+
         mappings.append({"src": path_str, "dst": path_str})
     return mappings
 
@@ -188,6 +219,29 @@ def clone_overlay(
             except git.GitError as e:
                 raise OverlayError(str(e))
 
+    # Handle SOPS encrypted files
+    decoded_dir = get_decoded_dir(root_dir)
+    encrypted_files: dict[str, dict[str, str]] = {}
+    encrypted_symlinks: list[str] = []
+
+    # Scan for encrypted files
+    enc_file_paths = sops.scan_encrypted_files(repo_dir)
+    if enc_file_paths:
+        # Find SOPS config
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+        if sops_config:
+            output.info(f"Found SOPS config: {output.path(str(sops_config.relative_to(repo_dir)))}")
+
+        try:
+            # Decrypt all encrypted files
+            output.info("Decrypting SOPS-encrypted files...")
+            encrypted_files = sops.decrypt_all_files(repo_dir, decoded_dir, sops_config)
+            output.info(f"Decrypted {len(encrypted_files)} file(s)")
+        except sops.SopsNotAvailableError as e:
+            raise OverlayError(str(e))
+        except sops.SopsDecryptionError as e:
+            raise OverlayError(str(e))
+
     # Generate mappings if not provided
     if explicit_mappings:
         mappings = explicit_mappings
@@ -197,19 +251,64 @@ def clone_overlay(
         except ValidationError as e:
             raise OverlayError(str(e))
     else:
-        mappings = _generate_mappings_from_repo(repo_dir)
+        mappings = _generate_mappings_from_repo(repo_dir, encrypted_files)
 
     # Load ignore patterns and filter mappings
     ignore_patterns = load_ignore_patterns(root_dir)
     mappings = filter_mappings(mappings, ignore_patterns)
 
-    # Create symlinks
+    # Create symlinks for regular files
     symlinks_created, dirs_created = _create_symlinks(root_dir, repo_dir, mappings, output, force=force)
+
+    # Create symlinks for decoded (encrypted) files
+    if encrypted_files:
+        for enc_path, metadata in encrypted_files.items():
+            decoded_path = metadata["decoded_path"]
+            # For encrypted files, dst is the decoded path (without .enc suffix)
+            dst = decoded_path
+            src_path = decoded_dir / decoded_path
+            dst_path = root_dir / dst
+
+            # Check destination
+            if dst_path.exists() or dst_path.is_symlink():
+                if force:
+                    if dst_path.is_symlink():
+                        dst_path.unlink()
+                    elif dst_path.is_file():
+                        dst_path.unlink()
+                    else:
+                        shutil.rmtree(dst_path)
+                else:
+                    raise OverlayError(f"Destination already exists: {dst}")
+
+            # Create parent directories if needed
+            parent = dst_path.parent
+            if not parent.exists():
+                parent.mkdir(parents=True, exist_ok=True)
+                rel_parent = parent.relative_to(root_dir)
+                for i in range(len(rel_parent.parts)):
+                    dir_path = Path(*rel_parent.parts[:i + 1])
+                    dir_str = str(dir_path)
+                    if dir_str not in dirs_created:
+                        dirs_created.append(dir_str)
+
+            # Calculate relative symlink path
+            rel_symlink = os.path.relpath(src_path, dst_path.parent)
+
+            # Create symlink
+            dst_path.symlink_to(rel_symlink)
+            encrypted_symlinks.append(dst)
+            symlinks_created.append(dst)
+            output.created(f"{dst} (decrypted)")
+
+            # Update metadata with symlink destination
+            metadata["symlink_dst"] = dst
 
     # Write state
     write_state(root_dir, {
         "symlinks": symlinks_created,
         "created_directories": dirs_created,
+        "encrypted_files": encrypted_files,
     })
 
     # Update git exclude
@@ -245,12 +344,69 @@ def sync_overlay(
         output = get_output()
 
     repo_dir = get_repo_dir(root_dir)
+    decoded_dir = get_decoded_dir(root_dir)
     overlay_config = config["overlay"]
     exit_code = 0
 
     # Check if repo exists
     if not repo_dir.exists():
         raise OverlayError("Overlay repo not cloned. Run 'repoverlay clone' first")
+
+    # Load state for encrypted files
+    state = read_state(root_dir)
+    encrypted_files = state.get("encrypted_files", {})
+
+    # Scan for ALL encrypted files (to exclude from regular mappings)
+    all_enc_files = sops.scan_encrypted_files(repo_dir)
+    all_enc_file_strs = {str(f) for f in all_enc_files}
+    new_enc_files = [f for f in all_enc_files if str(f) not in encrypted_files]
+
+    # Handle new encrypted files (e.g., pulled from remote)
+    if new_enc_files:
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+        if not sops.is_sops_available():
+            output.warning(
+                f"Found {len(new_enc_files)} encrypted file(s) but SOPS is not installed.\n"
+                "  Install SOPS to decrypt: brew install sops (macOS) or apt install sops (Linux)"
+            )
+            for f in new_enc_files:
+                output.info(f"    - {f}")
+            exit_code = 2
+        else:
+            # Try to decrypt new encrypted files
+            for enc_path in new_enc_files:
+                enc_path_str = str(enc_path)
+                decoded_name = sops.get_decoded_path(enc_path_str)
+                src = repo_dir / enc_path
+                dst = decoded_dir / decoded_name
+
+                try:
+                    sops.decrypt_file(src, dst, sops_config)
+                    encrypted_files[enc_path_str] = {
+                        "decoded_path": decoded_name,
+                        "symlink_dst": decoded_name,
+                        "last_encrypted_hash": sops.file_hash(src),
+                    }
+                    output.info(f"Decrypted new file: {output.path(decoded_name)}")
+                except sops.SopsDecryptionError as e:
+                    output.warning(f"Cannot decrypt {enc_path}: {e}")
+                    exit_code = 2
+                except sops.SopsError as e:
+                    output.warning(f"Failed to decrypt {enc_path}: {e}")
+                    exit_code = 2
+
+    # Re-decrypt existing files if encrypted sources changed
+    if encrypted_files:
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+        try:
+            re_decrypted = sops.re_decrypt_if_changed(
+                repo_dir, decoded_dir, encrypted_files, sops_config
+            )
+            if re_decrypted:
+                output.info(f"Re-decrypted {len(re_decrypted)} updated file(s)")
+        except sops.SopsError as e:
+            output.warning(f"Failed to re-decrypt some files: {e}")
+            exit_code = 2
 
     # Generate or use explicit mappings
     explicit_mappings = overlay_config.get("mappings")
@@ -262,7 +418,8 @@ def sync_overlay(
         except ValidationError as e:
             raise OverlayError(str(e))
     else:
-        mappings = _generate_mappings_from_repo(repo_dir)
+        # Exclude all encrypted files from regular mappings (even if decryption failed)
+        mappings = _generate_mappings_from_repo(repo_dir, encrypted_files, all_enc_file_strs)
 
     # Check repo URL mismatch (only for git repos)
     repo_url = overlay_config["repo"]
@@ -281,16 +438,19 @@ def sync_overlay(
         if exit_code == 0:
             exit_code = 2
 
-    # Load state
-    state = read_state(root_dir)
+    # Get old symlinks from already-loaded state
     old_symlinks = set(state.get("symlinks", []))
 
     # Load ignore patterns and filter mappings
     ignore_patterns = load_ignore_patterns(root_dir)
     mappings = filter_mappings(mappings, ignore_patterns)
 
-    # Determine new symlinks
+    # Determine new symlinks (include both regular mappings and decoded file destinations)
     new_symlinks = {m["dst"] for m in mappings}
+    for metadata in encrypted_files.values():
+        symlink_dst = metadata.get("symlink_dst")
+        if symlink_dst:
+            new_symlinks.add(symlink_dst)
 
     # Find symlinks to remove (in old state but not in new config)
     to_remove = old_symlinks - new_symlinks
@@ -336,6 +496,60 @@ def sync_overlay(
         root_dir, repo_dir, to_create, output, force=force
     )
 
+    # Create symlinks for decoded (encrypted) files that don't have symlinks yet
+    for enc_path_str, metadata in encrypted_files.items():
+        decoded_path = metadata.get("decoded_path")
+        symlink_dst = metadata.get("symlink_dst", decoded_path)
+        if not decoded_path:
+            continue
+
+        dst_path = root_dir / symlink_dst
+        src_path = decoded_dir / decoded_path
+
+        # Skip if symlink already exists and is correct
+        if dst_path.is_symlink():
+            expected_target = os.path.relpath(src_path, dst_path.parent)
+            try:
+                actual_target = os.readlink(dst_path)
+                if actual_target == expected_target:
+                    continue
+            except OSError:
+                pass
+
+        # Skip if decoded file doesn't exist (decryption failed)
+        if not src_path.exists():
+            continue
+
+        # Check if destination exists
+        if dst_path.exists() or dst_path.is_symlink():
+            if force:
+                if dst_path.is_symlink():
+                    dst_path.unlink()
+                elif dst_path.is_file():
+                    dst_path.unlink()
+                else:
+                    shutil.rmtree(dst_path)
+            else:
+                output.warning(f"Cannot create symlink, destination exists: {symlink_dst}")
+                continue
+
+        # Create parent directories if needed
+        parent = dst_path.parent
+        if not parent.exists():
+            parent.mkdir(parents=True, exist_ok=True)
+            rel_parent = parent.relative_to(root_dir)
+            for i in range(len(rel_parent.parts)):
+                dir_path = Path(*rel_parent.parts[:i + 1])
+                dir_str = str(dir_path)
+                if dir_str not in dirs_created:
+                    dirs_created.append(dir_str)
+
+        # Create symlink
+        rel_symlink = os.path.relpath(src_path, dst_path.parent)
+        dst_path.symlink_to(rel_symlink)
+        symlinks_created.append(symlink_dst)
+        output.created(f"{symlink_dst} (decrypted)")
+
     # Merge with existing symlinks that weren't removed
     all_symlinks = list((old_symlinks - to_remove) | set(symlinks_created))
 
@@ -346,6 +560,7 @@ def sync_overlay(
     write_state(root_dir, {
         "symlinks": all_symlinks,
         "created_directories": all_dirs,
+        "encrypted_files": encrypted_files,
     })
 
     # Update git exclude

@@ -26,12 +26,14 @@ class TestState:
         write_state(tmp_path, state)
 
         result = read_state(tmp_path)
-        assert result == state
+        # read_state adds encrypted_files key for backwards compatibility
+        expected = {"symlinks": ["config/secrets", ".env"], "encrypted_files": {}}
+        assert result == expected
 
     def test_read_missing_state(self, tmp_path):
         """Missing state file returns empty default."""
         result = read_state(tmp_path)
-        assert result == {"symlinks": [], "created_directories": []}
+        assert result == {"symlinks": [], "created_directories": [], "encrypted_files": {}}
 
     def test_write_creates_directory(self, tmp_path):
         """Write creates .repoverlay directory if needed."""

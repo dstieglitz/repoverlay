@@ -25,14 +25,31 @@ def read_state(root_dir: Path) -> dict[str, Any]:
 
     Returns:
         State dict, or empty default if file doesn't exist.
+
+    State schema:
+        {
+            "symlinks": [...],
+            "created_directories": [...],
+            "encrypted_files": {
+                "terraform.tfvars.enc": {
+                    "decoded_path": "terraform.tfvars",
+                    "symlink_dst": "terraform/terraform.tfvars",
+                    "last_encrypted_hash": "sha256:abc123..."
+                }
+            }
+        }
     """
     state_path = get_state_path(root_dir)
 
     if not state_path.exists():
-        return {"symlinks": [], "created_directories": []}
+        return {"symlinks": [], "created_directories": [], "encrypted_files": {}}
 
     with open(state_path) as f:
-        return json.load(f)
+        state = json.load(f)
+        # Ensure encrypted_files key exists for backwards compatibility
+        if "encrypted_files" not in state:
+            state["encrypted_files"] = {}
+        return state
 
 
 def write_state(root_dir: Path, state: dict[str, Any]) -> None:
