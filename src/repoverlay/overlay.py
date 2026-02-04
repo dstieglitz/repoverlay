@@ -279,7 +279,7 @@ def clone_overlay(
                     else:
                         shutil.rmtree(dst_path)
                 else:
-                    raise OverlayError(f"Destination already exists: {dst}")
+                    raise OverlayError(f"Destination already exists: {dst_path}")
 
             # Create parent directories if needed
             parent = dst_path.parent
@@ -618,7 +618,7 @@ def _create_symlinks(
                     import shutil
                     shutil.rmtree(dst_path)
             else:
-                raise OverlayError(f"Destination already exists: {dst}")
+                raise OverlayError(f"Destination already exists: {dst_path}")
 
         # Create parent directories if needed
         parent = dst_path.parent
