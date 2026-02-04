@@ -159,6 +159,22 @@ repoverlay unlink [--remove-repo] [--dry-run]
 | `--remove-repo` | Also remove `.repoverlay/` directory |
 | `--dry-run`, `-n` | Preview changes without executing |
 
+### `repoverlay list`
+
+List files in the overlay repository. Encrypted files are marked with `(encrypted)`.
+
+```bash
+repoverlay list
+```
+
+Example output:
+```
+ansible/inventory
+helm/values.yaml
+secrets.yaml.enc (encrypted)
+terraform.tfvars
+```
+
 ### Git Passthrough Commands
 
 Run git commands in the overlay repository:

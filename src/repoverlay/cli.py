@@ -133,6 +133,9 @@ def main() -> int:
     merge_parser = subparsers.add_parser("merge", help="Merge branch in overlay repo and sync")
     merge_parser.add_argument("branch", nargs="?", help="Branch to merge")
 
+    # list command
+    subparsers.add_parser("list", help="List files in overlay repo")
+
     args = parser.parse_args()
 
     # Set up output handler
@@ -157,6 +160,7 @@ def main() -> int:
         "diff": lambda: cmd_diff(args, output),
         "checkout": lambda: cmd_checkout(args, output),
         "merge": lambda: cmd_merge(args, output),
+        "list": lambda: cmd_list(output),
     }
 
     handler = handlers.get(args.command)
@@ -360,6 +364,41 @@ def cmd_status(output: Output) -> int:
     repo_dir, _ = result
 
     return git.status(repo_dir).returncode
+
+
+def cmd_list(output: Output) -> int:
+    """List files in overlay repo."""
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, _ = result
+
+    # Collect all files, excluding .git directory
+    files = []
+    for path in repo_dir.rglob("*"):
+        if path.is_file():
+            try:
+                rel_path = path.relative_to(repo_dir)
+                # Skip .git directory
+                if rel_path.parts[0] == ".git":
+                    continue
+                files.append(rel_path)
+            except ValueError:
+                pass
+
+    # Sort files for consistent output
+    files.sort()
+
+    # Print each file, marking encrypted ones with color
+    for rel_path in files:
+        if sops.is_encrypted_file(rel_path):
+            # Yellow for encrypted files
+            encrypted_text = output._colorize(f"{rel_path} (encrypted)", output.YELLOW)
+            print(encrypted_text)
+        else:
+            print(str(rel_path))
+
+    return 0
 
 
 def cmd_fetch(output: Output) -> int:
