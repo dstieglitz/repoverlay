@@ -120,16 +120,20 @@ def fetch(repo_dir: Path) -> None:
     run_git(repo_dir, ["fetch"], capture=True)
 
 
-def pull(repo_dir: Path) -> None:
+def pull(repo_dir: Path, opts: list[str] | None = None) -> None:
     """Pull from remote.
 
     Args:
         repo_dir: Path to the repository.
+        opts: Additional options (e.g., ["--rebase"], ["--no-rebase"], ["--ff-only"])
 
     Raises:
         GitError: If pull fails.
     """
-    run_git(repo_dir, ["pull"], capture=True)
+    cmd = ["pull"]
+    if opts:
+        cmd.extend(opts)
+    run_git(repo_dir, cmd, capture=True)
 
 
 def push(repo_dir: Path) -> None:

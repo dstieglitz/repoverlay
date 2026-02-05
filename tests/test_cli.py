@@ -626,6 +626,91 @@ class TestAddCommand:
         assert copied_file.exists()
         assert copied_file.read_text() == "external: data"
 
+    def test_add_repo_relative_path(self, tmp_main_repo, sample_config):
+        """Add command works with repo-relative paths (from status output)."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a nested file structure in the repo (simulating existing tracked file)
+        nested_file = repo_dir / "terraform" / "aws" / "main.tf"
+        nested_file.parent.mkdir(parents=True)
+        nested_file.write_text("# initial content")
+
+        # Commit the initial file
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=repo_dir,
+            capture_output=True,
+        )
+
+        # Modify the file (simulating user editing a tracked file)
+        nested_file.write_text("# modified content")
+
+        # Add using repo-relative path (like from 'repoverlay status' output)
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", "terraform/aws/main.tf"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "staged" in result.stdout.lower()
+
+        # Verify file is staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "M  terraform/aws/main.tf" in status_result.stdout
+
+    def test_add_modified_file_in_repo(self, tmp_main_repo, sample_config):
+        """Add command stages modified files that exist in repo."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Modify an existing file from the overlay (secrets/db.yaml from fixture)
+        secrets_file = repo_dir / "secrets" / "db.yaml"
+        secrets_file.write_text("password: modified_secret")
+
+        # Add using repo-relative path
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", "secrets/db.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # Verify file is staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "secrets/db.yaml" in status_result.stdout
+
 
 class TestResetCommand:
     """Tests for reset command."""
@@ -874,6 +959,59 @@ class TestResetCommand:
             text=True,
         )
         assert "A  secrets.yml.enc" not in status_result.stdout
+
+    def test_reset_repo_relative_path(self, tmp_main_repo, sample_config):
+        """Reset command works with repo-relative paths (from status output)."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a nested file structure and stage it
+        nested_file = repo_dir / "terraform" / "aws" / "main.tf"
+        nested_file.parent.mkdir(parents=True)
+        nested_file.write_text("# terraform config")
+
+        subprocess.run(
+            ["git", "add", "terraform/aws/main.tf"],
+            cwd=repo_dir,
+            capture_output=True,
+        )
+
+        # Verify file is staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "terraform/aws/main.tf" in status_result.stdout
+
+        # Reset using repo-relative path (like from status output)
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset", "terraform/aws/main.tf"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "unstaged" in result.stdout.lower()
+
+        # Verify file is no longer staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "A  terraform/aws/main.tf" not in status_result.stdout
 
 
 class TestAddEncryptPatterns:

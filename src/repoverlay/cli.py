@@ -108,7 +108,12 @@ def main() -> int:
     # Git passthrough commands
     subparsers.add_parser("status", help="Show git status of overlay repo")
     subparsers.add_parser("fetch", help="Fetch updates from overlay remote")
-    subparsers.add_parser("pull", help="Pull updates and sync symlinks")
+
+    pull_parser = subparsers.add_parser("pull", help="Pull updates and sync symlinks")
+    pull_parser.add_argument("--rebase", action="store_true", help="Rebase local commits on top of remote")
+    pull_parser.add_argument("--merge", action="store_true", help="Merge remote changes (create merge commit)")
+    pull_parser.add_argument("--ff-only", action="store_true", help="Only fast-forward, fail if not possible")
+
     subparsers.add_parser("push", help="Push overlay repo changes")
 
     commit_parser = subparsers.add_parser("commit", help="Commit changes in overlay repo")
@@ -156,7 +161,7 @@ def main() -> int:
         "unlink": lambda: cmd_unlink(args, output),
         "status": lambda: cmd_status(output),
         "fetch": lambda: cmd_fetch(output),
-        "pull": lambda: cmd_pull(output),
+        "pull": lambda: cmd_pull(args, output),
         "push": lambda: cmd_push(output),
         "commit": lambda: cmd_commit(args, output),
         "add": lambda: cmd_add(args, output),
@@ -421,17 +426,37 @@ def cmd_fetch(output: Output) -> int:
         return 1
 
 
-def cmd_pull(output: Output) -> int:
+def cmd_pull(args, output: Output) -> int:
     """Execute git pull in overlay repo, then sync."""
     result = _get_repo_dir_or_error(output)
     if result is None:
         return 1
     repo_dir, root_dir = result
 
+    # Build pull options
+    pull_opts = []
+    if args.rebase:
+        pull_opts.append("--rebase")
+    elif args.merge:
+        pull_opts.append("--no-rebase")
+    elif args.ff_only:
+        pull_opts.append("--ff-only")
+
     try:
-        git.pull(repo_dir)
+        git.pull(repo_dir, pull_opts if pull_opts else None)
         output.success("Pull complete.")
     except git.GitError as e:
+        error_msg = str(e)
+        # Detect divergent branches error and provide helpful hint
+        if "divergent branches" in error_msg or "Need to specify how to reconcile" in error_msg:
+            output.error("Divergent branches detected.")
+            output.info("")
+            output.info("You have local commits that the remote doesn't have, and vice versa.")
+            output.info("Choose how to reconcile:")
+            output.info("  repoverlay pull --rebase   # Rebase your commits on top of remote")
+            output.info("  repoverlay pull --merge    # Create a merge commit")
+            output.info("  repoverlay pull --ff-only  # Fail if fast-forward not possible")
+            return 1
         output.error(str(e))
         return 1
 
@@ -609,17 +634,69 @@ def cmd_add(args, output: Output) -> int:
     if config and "overlay" in config:
         encrypt_patterns = config["overlay"].get("encrypt_patterns", [])
 
-    # Determine which files should be encrypted
+    from pathlib import Path
+
+    # First pass: separate files that already exist in repo from external files
+    # Files already in repo just need to be staged, no copy/encrypt needed
+    files_in_repo = []
+    files_external = []
+
+    for file_path in args.files:
+        path = Path(file_path)
+
+        # For relative paths, check if they exist directly in repo
+        if not path.is_absolute():
+            repo_path = repo_dir / file_path
+            repo_path_enc = repo_dir / (file_path + ".enc")
+
+            if repo_path.exists():
+                files_in_repo.append(file_path)
+                continue
+            elif repo_path_enc.exists():
+                files_in_repo.append(file_path + ".enc")
+                continue
+
+        # For absolute paths, check if they're inside the repo
+        abs_path = path.resolve() if path.is_absolute() else (Path.cwd() / file_path).resolve()
+        try:
+            rel_to_repo = abs_path.relative_to(repo_dir)
+            # File is inside repo
+            if abs_path.exists():
+                files_in_repo.append(str(rel_to_repo))
+            else:
+                # Check for .enc version
+                enc_path = repo_dir / (str(rel_to_repo) + ".enc")
+                if enc_path.exists():
+                    files_in_repo.append(str(rel_to_repo) + ".enc")
+                else:
+                    files_external.append(file_path)
+        except ValueError:
+            # File is outside repo
+            files_external.append(file_path)
+
+    # Stage files that are already in repo
+    if files_in_repo:
+        try:
+            git.add(repo_dir, files_in_repo)
+            output.success(f"Staged {len(files_in_repo)} file(s).")
+        except git.GitError as e:
+            output.error(str(e))
+            return 1
+
+    # If no external files, we're done
+    if not files_external:
+        return 0
+
+    # Determine which external files should be encrypted
     files_to_encrypt = []
     files_to_add_plain = []
 
-    for file_path in args.files:
+    for file_path in files_external:
         should_encrypt = args.encrypt
 
         # Check against encrypt_patterns if not already flagged
         if not should_encrypt and encrypt_patterns:
             # Get relative path for pattern matching
-            from pathlib import Path
             abs_path = Path(file_path).resolve()
             try:
                 rel_path = abs_path.relative_to(repo_dir)
@@ -792,10 +869,22 @@ def cmd_reset(args, output: Output) -> int:
     # Convert file paths to repo-relative paths
     files_to_reset = []
     for file_path in raw_files:
-        abs_path = Path(file_path)
-        if not abs_path.is_absolute():
-            abs_path = Path.cwd() / file_path
-        abs_path = abs_path.resolve()
+        path = Path(file_path)
+
+        # For relative paths, first check if they exist directly in repo
+        if not path.is_absolute():
+            repo_path = repo_dir / file_path
+            repo_path_enc = repo_dir / (file_path + ".enc")
+
+            if repo_path.exists():
+                files_to_reset.append(file_path)
+                continue
+            elif repo_path_enc.exists():
+                files_to_reset.append(file_path + ".enc")
+                continue
+
+        # Handle absolute paths or paths not found in repo
+        abs_path = path.resolve() if path.is_absolute() else (Path.cwd() / file_path).resolve()
 
         # Try to get path relative to repo_dir
         try:
