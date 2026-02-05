@@ -185,6 +185,22 @@ def add(repo_dir: Path, files: list[str]) -> None:
     run_git(repo_dir, ["add"] + files, capture=True)
 
 
+def reset(repo_dir: Path, files: list[str] | None = None) -> None:
+    """Unstage files (git reset HEAD).
+
+    Args:
+        repo_dir: Path to the repository.
+        files: Files to unstage (if None, unstages all)
+
+    Raises:
+        GitError: If reset fails.
+    """
+    cmd = ["reset", "HEAD"]
+    if files:
+        cmd.extend(files)
+    run_git(repo_dir, cmd, capture=True)
+
+
 def commit(repo_dir: Path, message: str | None = None, args: list[str] | None = None) -> None:
     """Create a commit.
 

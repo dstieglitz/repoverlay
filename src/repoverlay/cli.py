@@ -124,6 +124,9 @@ def main() -> int:
         help="Encrypt files with SOPS before adding (creates .enc files)",
     )
 
+    reset_parser = subparsers.add_parser("reset", help="Unstage files from overlay repo")
+    reset_parser.add_argument("files", nargs="*", help="Files to unstage (default: all staged files)")
+
     diff_parser = subparsers.add_parser("diff", help="Show diff in overlay repo")
     diff_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git diff arguments")
 
@@ -157,6 +160,7 @@ def main() -> int:
         "push": lambda: cmd_push(output),
         "commit": lambda: cmd_commit(args, output),
         "add": lambda: cmd_add(args, output),
+        "reset": lambda: cmd_reset(args, output),
         "diff": lambda: cmd_diff(args, output),
         "checkout": lambda: cmd_checkout(args, output),
         "merge": lambda: cmd_merge(args, output),
@@ -614,17 +618,20 @@ def cmd_add(args, output: Output) -> int:
 
         # Check against encrypt_patterns if not already flagged
         if not should_encrypt and encrypt_patterns:
-            # Get relative path from repo_dir
+            # Get relative path for pattern matching
             from pathlib import Path
             abs_path = Path(file_path).resolve()
             try:
                 rel_path = abs_path.relative_to(repo_dir)
-                if matches_any_pattern(str(rel_path), encrypt_patterns):
-                    should_encrypt = True
             except ValueError:
-                # Path is not relative to repo_dir, check the raw path
-                if matches_any_pattern(file_path, encrypt_patterns):
-                    should_encrypt = True
+                # File is outside repo_dir, try relative to root_dir
+                try:
+                    rel_path = abs_path.relative_to(root_dir)
+                except ValueError:
+                    # File is outside project, use basename
+                    rel_path = Path(abs_path.name)
+            if matches_any_pattern(str(rel_path), encrypt_patterns):
+                should_encrypt = True
 
         if should_encrypt:
             files_to_encrypt.append(file_path)
@@ -664,8 +671,12 @@ def cmd_add(args, output: Output) -> int:
             try:
                 rel_path = src_path.relative_to(repo_dir)
             except ValueError:
-                # File is outside repo_dir, use basename
-                rel_path = Path(src_path.name)
+                # File is outside repo_dir, try relative to root_dir
+                try:
+                    rel_path = src_path.relative_to(root_dir)
+                except ValueError:
+                    # File is outside project, use basename
+                    rel_path = Path(src_path.name)
 
             enc_filename = str(rel_path) + ".enc"
             enc_dst = repo_dir / enc_filename
@@ -708,8 +719,44 @@ def cmd_add(args, output: Output) -> int:
 
     # Handle plain files
     if files_to_add_plain:
+        from pathlib import Path
+        import shutil
+
+        files_to_stage = []
+
+        for file_path in files_to_add_plain:
+            src_path = Path(file_path)
+            if not src_path.is_absolute():
+                src_path = Path.cwd() / file_path
+            src_path = src_path.resolve()
+
+            if not src_path.exists():
+                output.error(f"File not found: {file_path}")
+                return 1
+
+            # Check if file is inside the repo already
+            try:
+                rel_path = src_path.relative_to(repo_dir)
+                # File is already in repo, just add it
+                files_to_stage.append(str(rel_path))
+            except ValueError:
+                # File is outside repo_dir, need to copy it in
+                # Try to get relative path from root_dir (project root)
+                try:
+                    rel_path = src_path.relative_to(root_dir)
+                except ValueError:
+                    # File is completely outside the project, use basename
+                    rel_path = Path(src_path.name)
+
+                # Copy file into repo_dir
+                dst_path = repo_dir / rel_path
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+                output.info(f"Copied to overlay: {output.path(str(rel_path))}")
+                files_to_stage.append(str(rel_path))
+
         try:
-            git.add(repo_dir, files_to_add_plain)
+            git.add(repo_dir, files_to_stage)
             output.success("Files staged.")
         except git.GitError as e:
             output.error(str(e))
@@ -718,6 +765,66 @@ def cmd_add(args, output: Output) -> int:
         output.success("Files encrypted and staged.")
 
     return 0
+
+
+def cmd_reset(args, output: Output) -> int:
+    """Unstage files from overlay repo."""
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, root_dir = result
+
+    from pathlib import Path
+
+    # Filter out "HEAD" if user passed it (muscle memory from git reset HEAD)
+    raw_files = [f for f in (args.files or []) if f != "HEAD"]
+
+    if not raw_files:
+        # No files specified, reset all
+        try:
+            git.reset(repo_dir, None)
+            output.success("All files unstaged.")
+            return 0
+        except git.GitError as e:
+            output.error(str(e))
+            return 1
+
+    # Convert file paths to repo-relative paths
+    files_to_reset = []
+    for file_path in raw_files:
+        abs_path = Path(file_path)
+        if not abs_path.is_absolute():
+            abs_path = Path.cwd() / file_path
+        abs_path = abs_path.resolve()
+
+        # Try to get path relative to repo_dir
+        try:
+            rel_path = abs_path.relative_to(repo_dir)
+        except ValueError:
+            # File is outside repo_dir, try relative to root_dir
+            try:
+                rel_path = abs_path.relative_to(root_dir)
+            except ValueError:
+                # Use basename as fallback
+                rel_path = Path(abs_path.name)
+
+        # Check if file exists in repo, if not try with .enc suffix
+        repo_file = repo_dir / rel_path
+        if repo_file.exists():
+            files_to_reset.append(str(rel_path))
+        elif (repo_dir / (str(rel_path) + ".enc")).exists():
+            files_to_reset.append(str(rel_path) + ".enc")
+        else:
+            # File doesn't exist, try it anyway (git will error if invalid)
+            files_to_reset.append(str(rel_path))
+
+    try:
+        git.reset(repo_dir, files_to_reset)
+        output.success(f"Unstaged {len(files_to_reset)} file(s).")
+        return 0
+    except git.GitError as e:
+        output.error(str(e))
+        return 1
 
 
 def cmd_diff(args, output: Output) -> int:

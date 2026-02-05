@@ -511,3 +511,417 @@ class TestCommitCommand:
         )
         # Should not show "ahead" if tracking refs are properly updated
         assert "ahead" not in status_result.stdout
+
+
+class TestAddCommand:
+    """Tests for add command."""
+
+    def test_add_file_from_outside_repo(self, tmp_main_repo, sample_config):
+        """Add command copies files from outside overlay repo into it."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a file outside the overlay repo but inside the project
+        external_file = tmp_main_repo / "myconfig" / "settings.yaml"
+        external_file.parent.mkdir(parents=True)
+        external_file.write_text("key: value")
+
+        # Add the external file
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(external_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "Copied to overlay" in result.stdout
+
+        # Verify the file was copied into the overlay repo
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        copied_file = repo_dir / "myconfig" / "settings.yaml"
+        assert copied_file.exists()
+        assert copied_file.read_text() == "key: value"
+
+        # Verify the file was staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "myconfig/settings.yaml" in status_result.stdout
+
+    def test_add_file_already_in_repo(self, tmp_main_repo, sample_config):
+        """Add command stages files that are already in the overlay repo."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a new file directly in the overlay repo
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        new_file = repo_dir / "newfile.txt"
+        new_file.write_text("new content")
+
+        # Add the file using its path inside the repo
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(new_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "staged" in result.stdout.lower()
+
+        # Verify the file was staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "newfile.txt" in status_result.stdout
+
+    def test_add_file_completely_outside_project(self, tmp_main_repo, sample_config, tmp_path):
+        """Add command uses basename for files outside the project entirely."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a file completely outside the project
+        external_file = tmp_path / "outside" / "external.yaml"
+        external_file.parent.mkdir(parents=True)
+        external_file.write_text("external: data")
+
+        # Add the external file
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(external_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # Verify the file was copied using just the basename
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        copied_file = repo_dir / "external.yaml"
+        assert copied_file.exists()
+        assert copied_file.read_text() == "external: data"
+
+
+class TestResetCommand:
+    """Tests for reset command."""
+
+    def test_reset_specific_file(self, tmp_main_repo, sample_config):
+        """Reset command unstages specific files."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create and stage a new file
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        new_file = repo_dir / "staged.txt"
+        new_file.write_text("staged content")
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(new_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Verify file is staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "A  staged.txt" in status_result.stdout
+
+        # Reset the file
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset", "staged.txt"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "unstaged" in result.stdout.lower()
+
+        # Verify file is no longer staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "A  staged.txt" not in status_result.stdout
+        # File should now be untracked
+        assert "?? staged.txt" in status_result.stdout
+
+    def test_reset_all_files(self, tmp_main_repo, sample_config):
+        """Reset command without args unstages all files."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create and stage multiple new files
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        file1 = repo_dir / "file1.txt"
+        file2 = repo_dir / "file2.txt"
+        file1.write_text("content1")
+        file2.write_text("content2")
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(file1), str(file2)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Reset all
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "unstaged" in result.stdout.lower()
+
+        # Verify no files are staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        # Files should be untracked, not staged
+        assert "A " not in status_result.stdout
+        assert "?? file1.txt" in status_result.stdout
+        assert "?? file2.txt" in status_result.stdout
+
+    def test_reset_with_absolute_path_outside_repo(self, tmp_main_repo, sample_config):
+        """Reset command handles absolute paths outside repo."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a file outside repo, add it (which copies it in)
+        external_file = tmp_main_repo / "external" / "data.yaml"
+        external_file.parent.mkdir(parents=True)
+        external_file.write_text("key: value")
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(external_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Verify file is staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "external/data.yaml" in status_result.stdout
+
+        # Reset using the original absolute path (outside repo)
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset", str(external_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "unstaged" in result.stdout.lower()
+
+        # Verify file is no longer staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "A  external/data.yaml" not in status_result.stdout
+
+    def test_reset_ignores_head_argument(self, tmp_main_repo, sample_config):
+        """Reset command ignores HEAD if passed (git muscle memory)."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create and stage a file
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        new_file = repo_dir / "test.txt"
+        new_file.write_text("content")
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(new_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Reset with HEAD argument (like `git reset HEAD file`)
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset", "HEAD", "test.txt"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # Verify file is unstaged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "A  test.txt" not in status_result.stdout
+
+    def test_reset_encrypted_file_by_original_path(self, tmp_main_repo, sample_config):
+        """Reset finds .enc file when given original filename."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create and stage an encrypted file directly (simulating what add --encrypt does)
+        enc_file = repo_dir / "secrets.yml.enc"
+        enc_file.write_text("encrypted: content")
+
+        subprocess.run(
+            ["git", "add", "secrets.yml.enc"],
+            cwd=repo_dir,
+            capture_output=True,
+        )
+
+        # Verify file is staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "secrets.yml.enc" in status_result.stdout
+
+        # Reset using original filename (without .enc)
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset", "secrets.yml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # Verify .enc file is unstaged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "A  secrets.yml.enc" not in status_result.stdout
+
+
+class TestAddEncryptPatterns:
+    """Tests for add command with encrypt_patterns."""
+
+    def test_add_detects_secret_file_by_pattern(self, tmp_main_repo, tmp_overlay_repo):
+        """Add command should detect files matching encrypt_patterns."""
+        # Create config with encrypt_patterns
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo),
+                "mappings": [],
+                "encrypt_patterns": ["**/secrets.yml", "**/secrets.yaml"],
+            },
+        }
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a secrets file outside the repo
+        secrets_file = tmp_main_repo / "ansible" / "environments" / "all" / "secrets.yml"
+        secrets_file.parent.mkdir(parents=True)
+        secrets_file.write_text("password: supersecret")
+
+        # Add the file - should auto-detect as needing encryption
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(secrets_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+
+        # Check if it detected encryption (will fail without SOPS, but that's OK)
+        # The key is whether it TRIED to encrypt
+        print("stdout:", result.stdout)
+        print("stderr:", result.stderr)
+
+        # If SOPS is not installed, it should error about SOPS not installed
+        # If SOPS is installed but no config, it should error about encryption
+        # Either way, it should NOT just add as plain text silently
+        assert ("SOPS" in result.stderr or
+                "encrypt" in result.stderr.lower() or
+                "Encrypted" in result.stdout or
+                "encrypted" in result.stdout.lower())
