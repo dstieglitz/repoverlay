@@ -135,6 +135,9 @@ def main() -> int:
     diff_parser = subparsers.add_parser("diff", help="Show diff in overlay repo")
     diff_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git diff arguments")
 
+    log_parser = subparsers.add_parser("log", help="Show commit log of overlay repo")
+    log_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git log arguments")
+
     checkout_parser = subparsers.add_parser("checkout", help="Checkout ref in overlay repo and sync")
     checkout_parser.add_argument("ref", help="Branch, tag, or commit to checkout")
 
@@ -167,6 +170,7 @@ def main() -> int:
         "add": lambda: cmd_add(args, output),
         "reset": lambda: cmd_reset(args, output),
         "diff": lambda: cmd_diff(args, output),
+        "log": lambda: cmd_log(args, output),
         "checkout": lambda: cmd_checkout(args, output),
         "merge": lambda: cmd_merge(args, output),
         "list": lambda: cmd_list(output),
@@ -924,6 +928,16 @@ def cmd_diff(args, output: Output) -> int:
     repo_dir, _ = result
 
     return git.diff(repo_dir, args.args if args.args else None).returncode
+
+
+def cmd_log(args, output: Output) -> int:
+    """Execute git log in overlay repo."""
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, _ = result
+
+    return git.log(repo_dir, args.args if args.args else None).returncode
 
 
 def cmd_checkout(args, output: Output) -> int:

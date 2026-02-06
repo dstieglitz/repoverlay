@@ -176,6 +176,22 @@ def diff(repo_dir: Path, args: list[str] | None = None) -> subprocess.CompletedP
     return run_git(repo_dir, cmd, capture=False)
 
 
+def log(repo_dir: Path, args: list[str] | None = None) -> subprocess.CompletedProcess:
+    """Show git log.
+
+    Args:
+        repo_dir: Path to the repository.
+        args: Additional arguments
+
+    Returns:
+        CompletedProcess result
+    """
+    cmd = ["log"]
+    if args:
+        cmd.extend(args)
+    return run_git(repo_dir, cmd, capture=False)
+
+
 def add(repo_dir: Path, files: list[str]) -> None:
     """Add files to staging.
 
