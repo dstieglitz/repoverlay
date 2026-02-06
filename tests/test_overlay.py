@@ -276,6 +276,43 @@ class TestCloneOverlay:
         # Verify symlinks still work
         assert (tmp_main_repo / ".env").read_text() == "API_KEY=xxx"
 
+    def test_force_clone_blocked_with_unpushed_commits(self, tmp_main_repo, sample_config):
+        """Force clone is blocked when there are unpushed commits."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        # Make a commit in the overlay repo (will be unpushed)
+        (repo_dir / "newfile.txt").write_text("new content")
+        subprocess.run(["git", "add", "newfile.txt"], cwd=repo_dir, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "unpushed commit"],
+            cwd=repo_dir,
+            check=True,
+        )
+
+        # Force clone should be blocked
+        with pytest.raises(UnpushedCommitsError) as exc_info:
+            clone_overlay(tmp_main_repo, sample_config, force=True)
+
+        assert "unpushed commit" in str(exc_info.value)
+        assert exc_info.value.commit_count == 1
+
+    def test_force_clone_blocked_with_uncommitted_changes(self, tmp_main_repo, sample_config):
+        """Force clone is blocked when there are uncommitted changes."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        # Make uncommitted changes in the overlay repo
+        (repo_dir / ".env.production").write_text("modified content")
+
+        # Force clone should be blocked
+        with pytest.raises(UncommittedChangesError) as exc_info:
+            clone_overlay(tmp_main_repo, sample_config, force=True)
+
+        assert "uncommitted changes" in str(exc_info.value).lower()
+
     def test_dry_run_no_changes(self, tmp_main_repo, sample_config):
         """Dry run doesn't make changes."""
         output = Output(quiet=True)
@@ -493,6 +530,160 @@ class TestSyncOverlay:
 
 class TestUnlinkOverlay:
     """Tests for unlink_overlay function."""
+
+    def test_unlink_after_add_and_sync(self, tmp_main_repo, tmp_overlay_repo):
+        """Unlink removes symlinks for files added after initial clone.
+
+        Reproduces bug: clone (no mappings) -> add new file to repo -> sync -> unlink
+        should remove ALL symlinks including ones for newly added files.
+        """
+        # Clone without explicit mappings - symlinks auto-generated for all files
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo),
+            },
+        }
+        output = Output(quiet=True)
+        clone_overlay(tmp_main_repo, config, output=output)
+
+        # Verify initial symlinks
+        assert (tmp_main_repo / ".env.production").is_symlink()
+        assert (tmp_main_repo / "secrets" / "db.yaml").is_symlink()
+
+        # Add a new file to the cloned overlay repo
+        # (simulates a file appearing in the repo, e.g. after pull or repoverlay add)
+        repo_dir = get_repo_dir(tmp_main_repo)
+        (repo_dir / "newfile.txt").write_text("new content")
+
+        # Sync to pick up the new file (this is what pull does after fetching)
+        sync_overlay(tmp_main_repo, config, output=output)
+
+        # The new file should now be symlinked
+        assert (tmp_main_repo / "newfile.txt").is_symlink()
+        assert (tmp_main_repo / "newfile.txt").read_text() == "new content"
+
+        # Verify state includes the new symlink
+        state = read_state(tmp_main_repo)
+        assert "newfile.txt" in state["symlinks"], (
+            f"newfile.txt not tracked in state! State symlinks: {state['symlinks']}"
+        )
+
+        # Now unlink (force to bypass uncommitted changes check)
+        unlink_overlay(tmp_main_repo, force=True, output=output)
+
+        # Verify ALL symlinks are gone, including the newly added one
+        assert not (tmp_main_repo / ".env.production").is_symlink(), \
+            ".env.production symlink was not removed by unlink"
+        assert not (tmp_main_repo / "secrets" / "db.yaml").is_symlink(), \
+            "secrets/db.yaml symlink was not removed by unlink"
+        assert not (tmp_main_repo / "newfile.txt").exists(), \
+            "newfile.txt symlink was not removed by unlink - state not updated after add+sync!"
+
+    def test_unlink_after_new_files_added_to_repo_and_synced(self, tmp_main_repo, tmp_overlay_repo):
+        """Unlink must remove symlinks for files added to repo after clone.
+
+        Scenario: clone (no mappings) -> new file appears in repo (via add/pull) ->
+        sync creates symlink -> unlink should remove it.
+        Bug: sync creates symlinks for new files but doesn't track them in state,
+        so unlink leaves dangling symlinks behind.
+        """
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo),
+            },
+        }
+        output = Output(quiet=True)
+
+        # Step 1: Clone - creates symlinks for initial files
+        clone_overlay(tmp_main_repo, config, output=output)
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        initial_state = read_state(tmp_main_repo)
+        assert ".env.production" in initial_state["symlinks"]
+        assert "secrets/db.yaml" in initial_state["symlinks"]
+
+        # Step 2: New files appear in the repo (simulates add+commit or pull)
+        (repo_dir / "newconfig.yaml").write_text("db_host: localhost")
+        (repo_dir / "deploy" / "settings.ini").parent.mkdir(parents=True, exist_ok=True)
+        (repo_dir / "deploy" / "settings.ini").write_text("[deploy]\nenv=prod")
+
+        # Step 3: Sync picks up new files and creates symlinks
+        sync_overlay(tmp_main_repo, config, output=output)
+
+        # Verify new symlinks were created
+        assert (tmp_main_repo / "newconfig.yaml").is_symlink()
+        assert (tmp_main_repo / "deploy" / "settings.ini").is_symlink()
+
+        # KEY CHECK: Are the new symlinks tracked in state?
+        state_after_sync = read_state(tmp_main_repo)
+        assert "newconfig.yaml" in state_after_sync["symlinks"], \
+            f"newconfig.yaml missing from state! symlinks={state_after_sync['symlinks']}"
+        assert "deploy/settings.ini" in state_after_sync["symlinks"], \
+            f"deploy/settings.ini missing from state! symlinks={state_after_sync['symlinks']}"
+
+        # Step 4: Unlink should remove ALL symlinks
+        unlink_overlay(tmp_main_repo, force=True, output=output)
+
+        # Nothing should be left as a symlink
+        assert not (tmp_main_repo / ".env.production").is_symlink(), \
+            ".env.production not cleaned up"
+        assert not (tmp_main_repo / "secrets" / "db.yaml").is_symlink(), \
+            "secrets/db.yaml not cleaned up"
+        assert not (tmp_main_repo / "newconfig.yaml").exists(), \
+            "newconfig.yaml symlink left behind by unlink!"
+        assert not (tmp_main_repo / "deploy" / "settings.ini").exists(), \
+            "deploy/settings.ini symlink left behind by unlink!"
+
+    def test_unlink_after_multiple_syncs_with_new_files(self, tmp_main_repo, tmp_overlay_repo):
+        """Unlink removes all symlinks after multiple syncs add new files.
+
+        Tests: clone -> sync -> add files -> sync -> unlink. Verifies that
+        symlinks created across multiple sync cycles are all tracked in state.
+        """
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo),
+            },
+        }
+        output = Output(quiet=True)
+        clone_overlay(tmp_main_repo, config, output=output)
+        repo_dir = get_repo_dir(tmp_main_repo)
+
+        # First sync (no-op, same files)
+        sync_overlay(tmp_main_repo, config, output=output)
+
+        # Add new files to the repo at different times and sync each time
+        (repo_dir / "file1.txt").write_text("content 1")
+        sync_overlay(tmp_main_repo, config, output=output)
+        assert (tmp_main_repo / "file1.txt").is_symlink()
+
+        (repo_dir / "file2.txt").write_text("content 2")
+        (repo_dir / "subdir").mkdir(exist_ok=True)
+        (repo_dir / "subdir" / "file3.txt").write_text("content 3")
+        sync_overlay(tmp_main_repo, config, output=output)
+        assert (tmp_main_repo / "file2.txt").is_symlink()
+        assert (tmp_main_repo / "subdir" / "file3.txt").is_symlink()
+
+        # Verify ALL symlinks are in state
+        state = read_state(tmp_main_repo)
+        symlinks = set(state["symlinks"])
+        for expected in [".env.production", "secrets/db.yaml", "file1.txt", "file2.txt", "subdir/file3.txt"]:
+            assert expected in symlinks, (
+                f"{expected} not tracked in state! State: {symlinks}"
+            )
+
+        # Unlink
+        unlink_overlay(tmp_main_repo, force=True, output=output)
+
+        # ALL symlinks should be gone
+        assert not (tmp_main_repo / ".env.production").is_symlink()
+        assert not (tmp_main_repo / "secrets" / "db.yaml").is_symlink()
+        assert not (tmp_main_repo / "file1.txt").exists()
+        assert not (tmp_main_repo / "file2.txt").exists()
+        assert not (tmp_main_repo / "subdir" / "file3.txt").exists()
 
     def test_unlink_removes_symlinks(self, tmp_main_repo, sample_config):
         """Unlink removes all symlinks."""

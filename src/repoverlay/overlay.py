@@ -147,6 +147,26 @@ def clone_overlay(
     # Check if already cloned
     if repo_dir.exists():
         if force:
+            # Safety checks before removing repo
+            if (repo_dir / ".git").exists():
+                # Check for unpushed commits - hard block
+                has_unpushed, commit_count = git.has_unpushed_commits(repo_dir)
+                if has_unpushed:
+                    raise UnpushedCommitsError(
+                        f"Cannot force clone - there are {commit_count} unpushed commit(s) in the overlay repo.\n"
+                        "Run 'repoverlay push' first, or remove the commits with 'git reset'.",
+                        commit_count,
+                    )
+
+                # Check for uncommitted changes - hard block
+                has_uncommitted, changed_files = git.has_uncommitted_changes(repo_dir)
+                if has_uncommitted:
+                    raise UncommittedChangesError(
+                        "Cannot force clone - uncommitted changes detected in overlay repo.\n"
+                        "Commit or discard changes first.",
+                        changed_files,
+                    )
+
             if dry_run:
                 output.info(f"{output.dry_run_prefix()} Would remove {output.path(str(repo_dir))}")
             else:
