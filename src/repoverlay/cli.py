@@ -178,9 +178,38 @@ def main() -> int:
 
     handler = handlers.get(args.command)
     if handler:
+        _warn_branch_mismatch(output)
         return handler()
 
     return 0
+
+
+def _warn_branch_mismatch(output: Output) -> None:
+    """Warn if the overlay repo branch differs from the underlying repo branch."""
+    try:
+        config_path = find_config()
+    except ConfigError:
+        return
+
+    root_dir = config_path.parent
+    repo_dir = get_repo_dir(root_dir)
+
+    # Only check if overlay repo exists and is a git repo
+    if not repo_dir.exists() or not (repo_dir / ".git").exists():
+        return
+
+    # Only check if root_dir is a git repo
+    if not (root_dir / ".git").exists():
+        return
+
+    overlay_branch = git.get_current_branch(repo_dir)
+    underlying_branch = git.get_current_branch(root_dir)
+
+    if overlay_branch and underlying_branch and overlay_branch != underlying_branch:
+        output.warning(
+            f"Overlay repo is on branch '{overlay_branch}' "
+            f"but underlying repo is on '{underlying_branch}'"
+        )
 
 
 def _get_config_and_root(output: Output) -> tuple:
