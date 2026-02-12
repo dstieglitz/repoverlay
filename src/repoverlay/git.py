@@ -29,18 +29,23 @@ def clone(repo_url: str, target_dir: Path) -> None:
         raise GitError(f"Clone failed: {result.stderr.strip()}")
 
 
-def checkout(repo_dir: Path, ref: str) -> None:
+def checkout(repo_dir: Path, ref: str, *, new_branch: bool = False) -> None:
     """Checkout a specific ref in a repository.
 
     Args:
         repo_dir: Path to the repository.
         ref: Branch, tag, or commit to checkout.
+        new_branch: If True, create a new branch with -b flag.
 
     Raises:
         GitError: If checkout fails.
     """
+    cmd = ["git", "checkout"]
+    if new_branch:
+        cmd.append("-b")
+    cmd.append(ref)
     result = subprocess.run(
-        ["git", "checkout", ref],
+        cmd,
         cwd=repo_dir,
         capture_output=True,
         text=True,
@@ -136,8 +141,26 @@ def pull(repo_dir: Path, opts: list[str] | None = None) -> None:
     run_git(repo_dir, cmd, capture=True)
 
 
+def has_upstream(repo_dir: Path) -> bool:
+    """Check if the current branch has an upstream tracking branch.
+
+    Args:
+        repo_dir: Path to the repository.
+
+    Returns:
+        True if upstream is configured.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "@{u}"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
 def push(repo_dir: Path) -> None:
-    """Push to remote.
+    """Push to remote. Automatically sets upstream if not configured.
 
     Args:
         repo_dir: Path to the repository.
@@ -145,6 +168,11 @@ def push(repo_dir: Path) -> None:
     Raises:
         GitError: If push fails.
     """
+    if not has_upstream(repo_dir):
+        branch = get_current_branch(repo_dir)
+        if branch:
+            run_git(repo_dir, ["push", "--set-upstream", "origin", branch], capture=True)
+            return
     run_git(repo_dir, ["push"], capture=True)
 
 

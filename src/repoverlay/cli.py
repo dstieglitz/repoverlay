@@ -139,6 +139,7 @@ def main() -> int:
     log_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git log arguments")
 
     checkout_parser = subparsers.add_parser("checkout", help="Checkout ref in overlay repo and sync")
+    checkout_parser.add_argument("-b", dest="new_branch", action="store_true", help="Create a new branch")
     checkout_parser.add_argument("ref", help="Branch, tag, or commit to checkout")
 
     merge_parser = subparsers.add_parser("merge", help="Merge branch in overlay repo and sync")
@@ -977,7 +978,7 @@ def cmd_checkout(args, output: Output) -> int:
     repo_dir, root_dir = result
 
     try:
-        git.checkout(repo_dir, args.ref)
+        git.checkout(repo_dir, args.ref, new_branch=args.new_branch)
         output.success(f"Checked out {args.ref}.")
     except git.GitError as e:
         output.error(str(e))
