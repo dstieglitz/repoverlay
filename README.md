@@ -179,6 +179,46 @@ secrets.yaml.enc (encrypted)
 terraform.tfvars
 ```
 
+### `repoverlay import`
+
+Move files from the main repo into the overlay repo in one step. This replaces the manual workflow of copying a file, `git rm`-ing it, adding it to the overlay, and syncing.
+
+```bash
+repoverlay import <files...> [--encrypt] [--dry-run]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--encrypt`, `-e` | Encrypt files with SOPS before importing |
+| `--dry-run`, `-n` | Preview changes without executing |
+
+**What it does for each file:**
+1. Copies the file into the overlay repo (preserving directory structure)
+2. Removes it from the main repo's git index (if tracked)
+3. Replaces the original with a symlink to the overlay copy
+4. Stages the file in the overlay repo
+5. Updates state and git exclude files
+
+**Examples:**
+
+```bash
+# Import a single file
+repoverlay import terraform/terraform.tfvars
+
+# Import an entire directory
+repoverlay import scripts/config/
+
+# Import and encrypt sensitive files
+repoverlay import secrets.yaml --encrypt
+
+# Preview what would happen
+repoverlay import terraform/terraform.tfvars --dry-run
+```
+
+Files matching `encrypt_patterns` in `.repoverlay.yaml` are automatically encrypted, even without `--encrypt`.
+
+Untracked files (not in the main repo's git index) are imported normally — the `git rm` step is simply skipped for them.
+
 ### Git Passthrough Commands
 
 Run git commands in the overlay repository:
@@ -191,6 +231,7 @@ Run git commands in the overlay repository:
 | `repoverlay push` | Push overlay changes |
 | `repoverlay diff [args]` | Show overlay diff |
 | `repoverlay add [-e] <files>` | Stage files in overlay (`-e`/`--encrypt` to encrypt with SOPS) |
+| `repoverlay import [-e] <files>` | Import files from main repo into overlay (see below) |
 | `repoverlay commit [-a] -m "msg"` | Commit overlay changes (`-a` stages modified files) |
 | `repoverlay checkout <ref>` | Checkout ref, then sync symlinks |
 | `repoverlay merge <branch>` | Merge branch, then sync symlinks |
@@ -453,7 +494,14 @@ main-repo/
 
 ### Encrypting Files
 
-**Option 1: Use `--encrypt` flag:**
+**Option 1: Use `repoverlay import --encrypt` (recommended for files in the main repo):**
+```bash
+repoverlay import --encrypt path/to/secrets.yaml
+```
+
+This will encrypt the file, move it to the overlay, remove it from the main repo index, and create a symlink — all in one step.
+
+**Option 2: Use `repoverlay add --encrypt` (for external files):**
 ```bash
 repoverlay add --encrypt path/to/secrets.yaml
 ```

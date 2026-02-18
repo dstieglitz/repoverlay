@@ -5,6 +5,7 @@ import sys
 
 from . import __version__, git, sops
 from .config import ConfigError, find_config, load_config
+from .exclude import update_exclude_file
 from .ignore import matches_any_pattern
 from .output import Output, set_output
 from .intellij import configure_vcs_root, remove_vcs_root
@@ -129,6 +130,19 @@ def main() -> int:
         help="Encrypt files with SOPS before adding (creates .enc files)",
     )
 
+    import_parser = subparsers.add_parser("import", help="Import files from main repo into overlay")
+    import_parser.add_argument("files", nargs="+", help="Files to import")
+    import_parser.add_argument(
+        "--encrypt", "-e",
+        action="store_true",
+        help="Encrypt files with SOPS before importing",
+    )
+    import_parser.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="Preview changes without executing",
+    )
+
     reset_parser = subparsers.add_parser("reset", help="Unstage files from overlay repo")
     reset_parser.add_argument("files", nargs="*", help="Files to unstage (default: all staged files)")
 
@@ -169,6 +183,7 @@ def main() -> int:
         "push": lambda: cmd_push(output),
         "commit": lambda: cmd_commit(args, output),
         "add": lambda: cmd_add(args, output),
+        "import": lambda: cmd_import(args, output),
         "reset": lambda: cmd_reset(args, output),
         "diff": lambda: cmd_diff(args, output),
         "log": lambda: cmd_log(args, output),
@@ -890,6 +905,229 @@ def cmd_add(args, output: Output) -> int:
     elif files_to_encrypt:
         output.success("Files encrypted and staged.")
 
+    return 0
+
+
+def cmd_import(args, output: Output) -> int:
+    """Import files from main repo into overlay repo.
+
+    Copies files into the overlay repo, removes them from the main repo index,
+    creates symlinks, and updates state.
+    """
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, root_dir = result
+
+    # Load config for encrypt_patterns
+    cfg_result = _get_config_and_root(output)
+    config = cfg_result[0] if cfg_result else None
+    encrypt_patterns = []
+    if config and "overlay" in config:
+        encrypt_patterns = config["overlay"].get("encrypt_patterns", [])
+
+    # Load existing state
+    state = read_state(root_dir)
+    existing_symlinks = state.get("symlinks", [])
+    existing_dirs = state.get("created_directories", [])
+    encrypted_files = state.get("encrypted_files", {})
+
+    from pathlib import Path
+    import shutil
+    import os
+
+    decoded_dir = get_decoded_dir(root_dir)
+    dry_run = args.dry_run
+
+    new_symlinks = []
+    new_dirs = []
+    files_to_git_rm = []
+    files_to_git_add = []
+
+    # Collect all files to process
+    all_files = []
+    for file_arg in args.files:
+        path = Path(file_arg)
+        if not path.is_absolute():
+            abs_path = (Path.cwd() / file_arg).resolve()
+        else:
+            abs_path = path.resolve()
+
+        # Resolve to root_dir-relative path
+        try:
+            rel_path = abs_path.relative_to(root_dir)
+        except ValueError:
+            output.error(f"File is outside the project root: {file_arg}")
+            return 1
+
+        # Verify the file exists
+        if not abs_path.exists():
+            output.error(f"File not found: {file_arg}")
+            return 1
+
+        # If directory, collect all files recursively
+        if abs_path.is_dir():
+            for child in abs_path.rglob("*"):
+                if child.is_file():
+                    all_files.append(child.relative_to(root_dir))
+        else:
+            all_files.append(rel_path)
+
+    if not all_files:
+        output.warning("No files to import.")
+        return 0
+
+    # Determine which files are tracked BEFORE we modify anything
+    all_file_strs = [str(f) for f in all_files]
+    tracked_files = set(git.get_tracked_files(root_dir, all_file_strs)) if not dry_run else set()
+
+    sops_config = None
+    if args.encrypt or encrypt_patterns:
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+
+    for rel_path in all_files:
+        rel_str = str(rel_path)
+        abs_path = root_dir / rel_path
+
+        # Check if already in overlay
+        if (repo_dir / rel_path).exists():
+            output.warning(f"Skipping {rel_str} - already exists in overlay repo")
+            continue
+
+        # Determine if it should be encrypted
+        should_encrypt = args.encrypt
+        if not should_encrypt and encrypt_patterns:
+            if matches_any_pattern(rel_str, encrypt_patterns):
+                should_encrypt = True
+
+        if dry_run:
+            if should_encrypt:
+                output.info(f"{output.dry_run_prefix()} Would import and encrypt {output.path(rel_str)}")
+            else:
+                output.info(f"{output.dry_run_prefix()} Would import {output.path(rel_str)}")
+            continue
+
+        if should_encrypt:
+            # Encrypt the file into the overlay repo
+            if not sops.is_sops_available():
+                output.error(
+                    "SOPS is not installed. Install it with:\n"
+                    "  brew install sops      # macOS\n"
+                    "  apt install sops       # Debian/Ubuntu\n"
+                    "  choco install sops     # Windows"
+                )
+                return 1
+
+            enc_filename = rel_str + ".enc"
+            enc_dst = repo_dir / enc_filename
+            decoded_dst = decoded_dir / rel_path
+
+            try:
+                # Ensure parent dirs exist
+                enc_dst.parent.mkdir(parents=True, exist_ok=True)
+                sops.encrypt_file(abs_path, enc_dst, sops_config)
+                output.info(f"Encrypted: {output.path(enc_filename)}")
+
+                # Copy plaintext to decoded dir
+                decoded_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(abs_path, decoded_dst)
+
+                # Track encrypted file state
+                encrypted_files[enc_filename] = {
+                    "decoded_path": rel_str,
+                    "symlink_dst": rel_str,
+                    "last_encrypted_hash": sops.file_hash(enc_dst),
+                }
+                files_to_git_add.append(enc_filename)
+
+            except sops.SopsError as e:
+                output.error(f"Failed to encrypt {rel_str}: {e}")
+                return 1
+
+            # Create symlink to decoded file
+            dst_path = root_dir / rel_path
+            src_path = decoded_dir / rel_path
+            rel_symlink = os.path.relpath(src_path, dst_path.parent)
+
+        else:
+            # Copy file to overlay repo (preserving directory structure)
+            dst_in_repo = repo_dir / rel_path
+            dst_in_repo.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(abs_path, dst_in_repo)
+            output.info(f"Copied to overlay: {output.path(rel_str)}")
+            files_to_git_add.append(rel_str)
+
+            # Create symlink to overlay repo file
+            dst_path = root_dir / rel_path
+            src_path = repo_dir / rel_path
+            rel_symlink = os.path.relpath(src_path, dst_path.parent)
+
+        # git rm --cached from main repo
+        files_to_git_rm.append(rel_str)
+
+        # Remove the original file and create symlink
+        dst_path.unlink()
+        dst_path.symlink_to(rel_symlink)
+        new_symlinks.append(rel_str)
+        output.created(f"{rel_str} (symlink)")
+
+        # Track created parent directories
+        parent = dst_path.parent
+        if parent != root_dir:
+            rel_parent = parent.relative_to(root_dir)
+            for i in range(len(rel_parent.parts)):
+                dir_path = Path(*rel_parent.parts[:i + 1])
+                dir_str = str(dir_path)
+                if dir_str not in existing_dirs and dir_str not in new_dirs:
+                    new_dirs.append(dir_str)
+
+    if dry_run:
+        return 0
+
+    if not files_to_git_rm and not files_to_git_add:
+        output.warning("No files were imported.")
+        return 0
+
+    # git rm --cached from main repo index (only for files that were tracked)
+    if files_to_git_rm:
+        tracked = [f for f in files_to_git_rm if f in tracked_files]
+        if tracked:
+            try:
+                git.rm(root_dir, tracked, cached=True)
+                output.info(f"Removed {len(tracked)} file(s) from main repo index")
+            except git.GitError as e:
+                output.error(f"Failed to remove from main repo index: {e}")
+                return 1
+        untracked_count = len(files_to_git_rm) - len(tracked)
+        if untracked_count:
+            output.info(f"Skipped {untracked_count} untracked file(s) (not in main repo index)")
+
+    # git add in overlay repo
+    if files_to_git_add:
+        try:
+            git.add(repo_dir, files_to_git_add)
+            output.info(f"Staged {len(files_to_git_add)} file(s) in overlay repo")
+        except git.GitError as e:
+            output.error(f"Failed to stage in overlay repo: {e}")
+            return 1
+
+    # Update state
+    all_symlinks = list(set(existing_symlinks + new_symlinks))
+    all_dirs = list(set(existing_dirs + new_dirs))
+
+    write_state(root_dir, {
+        "symlinks": all_symlinks,
+        "created_directories": all_dirs,
+        "encrypted_files": encrypted_files,
+    })
+
+    # Update git exclude
+    try:
+        update_exclude_file(root_dir, all_symlinks)
+    except Exception:
+        pass
+
+    output.success(f"Imported {len(new_symlinks)} file(s) into overlay repo.")
     return 0
 
 

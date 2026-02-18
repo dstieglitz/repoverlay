@@ -220,6 +220,24 @@ def log(repo_dir: Path, args: list[str] | None = None) -> subprocess.CompletedPr
     return run_git(repo_dir, cmd, capture=False)
 
 
+def rm(repo_dir: Path, files: list[str], *, cached: bool = False) -> None:
+    """Remove files from the repository.
+
+    Args:
+        repo_dir: Path to the repository.
+        files: Files to remove
+        cached: If True, only remove from the index (keep working copy)
+
+    Raises:
+        GitError: If rm fails.
+    """
+    cmd = ["rm"]
+    if cached:
+        cmd.append("--cached")
+    cmd.extend(files)
+    run_git(repo_dir, cmd, capture=True)
+
+
 def add(repo_dir: Path, files: list[str]) -> None:
     """Add files to staging.
 
