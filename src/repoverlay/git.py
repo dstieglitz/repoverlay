@@ -428,3 +428,41 @@ def has_unpushed_commits(repo_dir: Path) -> tuple[bool, int]:
 
     count = int(result.stdout.strip())
     return count > 0, count
+
+
+def get_tracked_files(repo_dir: Path, paths: list[str]) -> list[str]:
+    """Check which of the given paths are tracked by git.
+
+    Args:
+        repo_dir: Path to the repository.
+        paths: List of paths to check (relative to repo_dir).
+
+    Returns:
+        List of paths that are tracked (in the index).
+    """
+    if not paths:
+        return []
+
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--"] + paths,
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        # Some or all files are not tracked; fall back to checking one-by-one
+        # by listing all tracked files and intersecting
+        result = subprocess.run(
+            ["git", "ls-files", "--"] + paths,
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+
+    tracked = result.stdout.strip()
+    if not tracked:
+        return []
+    return tracked.split("\n")

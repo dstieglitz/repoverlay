@@ -404,7 +404,22 @@ def cmd_status(output: Output) -> int:
     result = _get_repo_dir_or_error(output)
     if result is None:
         return 1
-    repo_dir, _ = result
+    repo_dir, root_dir = result
+
+    # Check if any overlay symlinks are tracked by the main repo
+    state = read_state(root_dir)
+    symlinks = state.get("symlinks", [])
+    if symlinks and (root_dir / ".git").exists():
+        tracked = git.get_tracked_files(root_dir, symlinks)
+        if tracked:
+            output.warning(
+                f"Found {len(tracked)} overlay symlink(s) tracked by the main repo!"
+            )
+            output.info("These should be removed from the main repo's index:")
+            for path in tracked:
+                output.info(f"  {path}")
+            output.info("Run: git rm --cached " + " ".join(tracked))
+            output.info("")
 
     return git.status(repo_dir).returncode
 
