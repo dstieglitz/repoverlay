@@ -251,6 +251,24 @@ def add(repo_dir: Path, files: list[str]) -> None:
     run_git(repo_dir, ["add"] + files, capture=True)
 
 
+def restore(repo_dir: Path, files: list[str], *, staged: bool = False) -> None:
+    """Restore files (git restore).
+
+    Args:
+        repo_dir: Path to the repository.
+        files: Files to restore
+        staged: If True, restore staged changes (--staged)
+
+    Raises:
+        GitError: If restore fails.
+    """
+    cmd = ["restore"]
+    if staged:
+        cmd.append("--staged")
+    cmd.extend(files)
+    run_git(repo_dir, cmd, capture=True)
+
+
 def reset(repo_dir: Path, files: list[str] | None = None) -> None:
     """Unstage files (git reset HEAD).
 

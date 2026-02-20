@@ -291,6 +291,176 @@ class TestCLI:
         )
         assert result.returncode == 0
 
+    def test_log_command(self, tmp_main_repo, sample_config):
+        """Log command shows overlay commit log."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "log"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+    def test_log_with_args(self, tmp_main_repo, sample_config):
+        """Log command passes arguments to git."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Use -1 to limit output to one commit
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "log", "--", "-1"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+    def test_log_without_clone_errors(self, tmp_main_repo, sample_config):
+        """Log command errors if overlay not cloned."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "log"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+
+    def test_merge_command(self, tmp_main_repo, tmp_overlay_repo):
+        """Merge command merges a branch and syncs symlinks."""
+        # Use config without explicit mappings so new files get symlinks
+        config = {
+            "version": 1,
+            "overlay": {"repo": str(tmp_overlay_repo)},
+        }
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a feature branch with a new file
+        subprocess.run(
+            ["git", "checkout", "-b", "feature"],
+            cwd=repo_dir, capture_output=True,
+        )
+        new_file = repo_dir / "feature.yaml"
+        new_file.write_text("feature: true")
+        subprocess.run(["git", "add", "feature.yaml"], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add feature file"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Go back to the default branch
+        subprocess.run(
+            ["git", "checkout", "-"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Merge the feature branch via repoverlay
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "merge", "feature"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        # The new file should exist in repo after merge
+        assert new_file.exists()
+        assert new_file.read_text() == "feature: true"
+
+        # Symlink should have been created by sync
+        symlink = tmp_main_repo / "feature.yaml"
+        assert symlink.is_symlink()
+
+    def test_merge_syncs_symlinks(self, tmp_main_repo, tmp_overlay_repo):
+        """Merge creates symlinks for nested files added in the merged branch."""
+        config = {
+            "version": 1,
+            "overlay": {"repo": str(tmp_overlay_repo)},
+        }
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a feature branch with nested files
+        subprocess.run(
+            ["git", "checkout", "-b", "feature-nested"],
+            cwd=repo_dir, capture_output=True,
+        )
+        nested = repo_dir / "config" / "new" / "settings.yaml"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("new_setting: true")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add nested config"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Back to default branch
+        subprocess.run(
+            ["git", "checkout", "-"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Merge
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "merge", "feature-nested"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        # Nested symlink should be created
+        symlink = tmp_main_repo / "config" / "new" / "settings.yaml"
+        assert symlink.is_symlink()
+        assert symlink.read_text() == "new_setting: true"
+
+    def test_merge_without_clone_errors(self, tmp_main_repo, sample_config):
+        """Merge command errors if overlay not cloned."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "merge", "somebranch"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+
     def test_fetch_command(self, tmp_main_repo, sample_config):
         """Fetch command runs git fetch."""
         config_path = tmp_main_repo / ".repoverlay.yaml"
@@ -1063,3 +1233,549 @@ class TestAddEncryptPatterns:
                 "encrypt" in result.stderr.lower() or
                 "Encrypted" in result.stdout or
                 "encrypted" in result.stdout.lower())
+
+    def test_add_symlink_to_decoded_file_stages_enc(self, tmp_path, tmp_overlay_repo):
+        """Add on a symlink pointing to .repoverlay/decoded/ should stage the .enc file, not create nested dirs."""
+        import json
+
+        # Resolve tmp_path to avoid macOS /var -> /private/var symlink mismatch
+        # which masks the bug by making relative_to(root_dir) fail on the resolved path
+        tmp_main_repo = (tmp_path / "main-resolved").resolve()
+        tmp_main_repo.mkdir()
+        subprocess.run(["git", "init"], cwd=tmp_main_repo, check=True, capture_output=True)
+
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo.resolve()),
+            },
+        }
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        decoded_dir = tmp_main_repo / ".repoverlay" / "decoded"
+
+        # Simulate a previously imported encrypted file:
+        # 1. Create the .enc file in the repo
+        enc_file = repo_dir / "secrets.yaml.enc"
+        enc_file.write_text("ENC[AES256,data:encrypted]")
+        subprocess.run(["git", "add", "secrets.yaml.enc"], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add encrypted file"],
+            cwd=repo_dir,
+            capture_output=True,
+        )
+
+        # 2. Create the decoded file
+        decoded_dir.mkdir(parents=True, exist_ok=True)
+        decoded_file = decoded_dir / "secrets.yaml"
+        decoded_file.write_text("password: original")
+
+        # 3. Create symlink in project root pointing to decoded file
+        symlink_path = tmp_main_repo / "secrets.yaml"
+        rel_symlink = os.path.relpath(decoded_file, symlink_path.parent)
+        symlink_path.symlink_to(rel_symlink)
+
+        # 4. Write state as if import --encrypt had been run
+        state_path = tmp_main_repo / ".repoverlay" / "state.json"
+        state = {
+            "symlinks": ["secrets.yaml"],
+            "created_directories": [],
+            "encrypted_files": {
+                "secrets.yaml.enc": {
+                    "decoded_path": "secrets.yaml",
+                    "symlink_dst": "secrets.yaml",
+                    "last_encrypted_hash": "sha256:fakehash",
+                }
+            },
+        }
+        state_path.write_text(json.dumps(state, indent=2))
+
+        # Now modify the decoded file through the symlink
+        symlink_path.write_text("password: modified")
+
+        # Modify the .enc file too (simulating what re-encryption would do)
+        enc_file.write_text("ENC[AES256,data:re-encrypted]")
+
+        # Run repoverlay add using the absolute path of the symlink.
+        # This bypasses the first-pass relative ".enc" check and triggers
+        # resolve() to follow the symlink into .repoverlay/decoded/.
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(symlink_path)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "staged" in result.stdout.lower()
+
+        # Verify: the .enc file should be staged, NOT a file under .repoverlay/
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "secrets.yaml.enc" in status_result.stdout
+        # Must NOT have created nested .repoverlay dir inside the repo
+        assert ".repoverlay" not in status_result.stdout
+        assert not (repo_dir / ".repoverlay").exists()
+
+
+class TestImport:
+    """Tests for import command with absolute and relative paths."""
+
+    def _setup_overlay(self, tmp_main_repo, tmp_overlay_repo):
+        """Clone overlay into tmp_main_repo and return repo_dir."""
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo),
+            },
+        }
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+        return tmp_main_repo / ".repoverlay" / "repo"
+
+    def test_import_relative_path(self, tmp_main_repo, tmp_overlay_repo):
+        """Import with a relative path copies file to overlay and creates symlink."""
+        repo_dir = self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        # Create a file in the main repo
+        target = tmp_main_repo / "settings.yaml"
+        target.write_text("key: value")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", "settings.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "imported" in result.stdout.lower()
+
+        # File should now be a symlink
+        assert target.is_symlink()
+        # File should exist in overlay repo
+        assert (repo_dir / "settings.yaml").exists()
+        assert (repo_dir / "settings.yaml").read_text() == "key: value"
+
+    def test_import_absolute_path(self, tmp_main_repo, tmp_overlay_repo):
+        """Import with an absolute path copies file to overlay and creates symlink."""
+        repo_dir = self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        # Create a file in the main repo
+        target = tmp_main_repo / "settings.yaml"
+        target.write_text("key: value")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", str(target)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "imported" in result.stdout.lower()
+
+        # File should now be a symlink
+        assert target.is_symlink()
+        # File should exist in overlay repo
+        assert (repo_dir / "settings.yaml").exists()
+        assert (repo_dir / "settings.yaml").read_text() == "key: value"
+
+    def test_import_nested_relative_path(self, tmp_main_repo, tmp_overlay_repo):
+        """Import with a nested relative path preserves directory structure."""
+        repo_dir = self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        # Create a nested file in the main repo
+        target = tmp_main_repo / "config" / "app" / "settings.yaml"
+        target.parent.mkdir(parents=True)
+        target.write_text("nested: true")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", "config/app/settings.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        assert target.is_symlink()
+        assert (repo_dir / "config" / "app" / "settings.yaml").exists()
+        assert (repo_dir / "config" / "app" / "settings.yaml").read_text() == "nested: true"
+
+    def test_import_nested_absolute_path(self, tmp_main_repo, tmp_overlay_repo):
+        """Import with a nested absolute path preserves directory structure."""
+        repo_dir = self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        # Create a nested file in the main repo
+        target = tmp_main_repo / "config" / "app" / "settings.yaml"
+        target.parent.mkdir(parents=True)
+        target.write_text("nested: true")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", str(target)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        assert target.is_symlink()
+        assert (repo_dir / "config" / "app" / "settings.yaml").exists()
+        assert (repo_dir / "config" / "app" / "settings.yaml").read_text() == "nested: true"
+
+    def test_import_dry_run(self, tmp_main_repo, tmp_overlay_repo):
+        """Import with --dry-run previews changes without executing."""
+        self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        target = tmp_main_repo / "settings.yaml"
+        target.write_text("key: value")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", "--dry-run", "settings.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # File should NOT be a symlink
+        assert not target.is_symlink()
+        assert target.read_text() == "key: value"
+
+    def test_import_file_outside_project_errors(self, tmp_main_repo, tmp_overlay_repo, tmp_path):
+        """Import rejects files outside the project root."""
+        self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        external_file = tmp_path / "outside" / "file.yaml"
+        external_file.parent.mkdir(parents=True)
+        external_file.write_text("external: true")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", str(external_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+
+    def test_import_already_in_overlay_skips(self, tmp_main_repo, tmp_overlay_repo):
+        """Import skips files that already exist in the overlay repo."""
+        repo_dir = self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        # .env.production already exists in overlay from fixture
+        target = tmp_main_repo / ".env.production"
+        # The file is already a symlink from clone
+        if target.is_symlink():
+            target.unlink()
+        target.write_text("API_KEY=yyy")
+
+        # Create the file in overlay repo too (simulating it already being there)
+        (repo_dir / ".env.production").write_text("API_KEY=xxx")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", ".env.production"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        # Should warn about skipping (warnings go to stderr), not error
+        combined = result.stdout.lower() + result.stderr.lower()
+        assert "skip" in combined or "already exists" in combined
+
+    def test_import_tracked_file_removes_from_index(self, tmp_main_repo, tmp_overlay_repo):
+        """Import of a git-tracked file removes it from the main repo index."""
+        repo_dir = self._setup_overlay(tmp_main_repo, tmp_overlay_repo)
+
+        # Create and track a file in main repo
+        target = tmp_main_repo / "tracked.yaml"
+        target.write_text("tracked: true")
+
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_main_repo, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=tmp_main_repo, capture_output=True,
+        )
+        subprocess.run(["git", "add", "tracked.yaml"], cwd=tmp_main_repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add tracked"],
+            cwd=tmp_main_repo, capture_output=True,
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "import", "tracked.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # File should be a symlink now
+        assert target.is_symlink()
+
+        # Should be removed from main repo index
+        ls_result = subprocess.run(
+            ["git", "ls-files", "tracked.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert "tracked.yaml" not in ls_result.stdout
+
+
+class TestRestore:
+    """Tests for restore command with absolute and relative paths."""
+
+    def _setup_overlay_with_staged_file(self, tmp_main_repo, sample_config):
+        """Clone overlay and stage a modified file. Returns (repo_dir, file_path)."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create and commit a file
+        test_file = repo_dir / "testfile.txt"
+        test_file.write_text("original content")
+        subprocess.run(["git", "add", "testfile.txt"], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add testfile"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Modify and stage the file
+        test_file.write_text("modified content")
+        subprocess.run(["git", "add", "testfile.txt"], cwd=repo_dir, capture_output=True)
+
+        return repo_dir, test_file
+
+    def test_restore_staged_relative_path(self, tmp_main_repo, sample_config):
+        """Restore --staged with relative path unstages the file."""
+        repo_dir, _ = self._setup_overlay_with_staged_file(tmp_main_repo, sample_config)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "restore", "--staged", "testfile.txt"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "unstaged" in result.stdout.lower()
+
+        # File should no longer be staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        # Should show as modified (unstaged) not staged
+        assert "M  testfile.txt" not in status_result.stdout  # not staged
+        assert " M testfile.txt" in status_result.stdout  # unstaged modification
+
+    def test_restore_staged_absolute_path(self, tmp_main_repo, sample_config):
+        """Restore --staged with absolute path unstages the file."""
+        repo_dir, test_file = self._setup_overlay_with_staged_file(tmp_main_repo, sample_config)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "restore", "--staged", str(test_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "unstaged" in result.stdout.lower()
+
+        # File should no longer be staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "M  testfile.txt" not in status_result.stdout
+        assert " M testfile.txt" in status_result.stdout
+
+    def test_restore_unstaged_changes_relative_path(self, tmp_main_repo, sample_config):
+        """Restore without --staged discards working tree changes (relative path)."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create and commit a file
+        test_file = repo_dir / "testfile.txt"
+        test_file.write_text("original content")
+        subprocess.run(["git", "add", "testfile.txt"], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add testfile"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Modify but don't stage
+        test_file.write_text("modified content")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "restore", "testfile.txt"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "restored" in result.stdout.lower()
+
+        # File should be back to original content
+        assert test_file.read_text() == "original content"
+
+    def test_restore_unstaged_changes_absolute_path(self, tmp_main_repo, sample_config):
+        """Restore without --staged discards working tree changes (absolute path)."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create and commit a file
+        test_file = repo_dir / "testfile.txt"
+        test_file.write_text("original content")
+        subprocess.run(["git", "add", "testfile.txt"], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add testfile"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Modify but don't stage
+        test_file.write_text("modified content")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "restore", str(test_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "restored" in result.stdout.lower()
+
+        # File should be back to original content
+        assert test_file.read_text() == "original content"
+
+    def test_restore_staged_encrypted_file_by_original_name(self, tmp_main_repo, sample_config):
+        """Restore --staged with original filename resolves to .enc file."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create and commit an encrypted file
+        enc_file = repo_dir / "secrets.yaml.enc"
+        enc_file.write_text("ENC[original]")
+        subprocess.run(["git", "add", "secrets.yaml.enc"], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add encrypted"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Modify and stage
+        enc_file.write_text("ENC[modified]")
+        subprocess.run(["git", "add", "secrets.yaml.enc"], cwd=repo_dir, capture_output=True)
+
+        # Restore using the name without .enc suffix
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "restore", "--staged", "secrets.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        # File should no longer be staged
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "M  secrets.yaml.enc" not in status_result.stdout
+
+    def test_restore_nested_relative_path(self, tmp_main_repo, sample_config):
+        """Restore --staged with nested relative path."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create nested file
+        nested_file = repo_dir / "config" / "app" / "settings.yaml"
+        nested_file.parent.mkdir(parents=True)
+        nested_file.write_text("original: true")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add nested"],
+            cwd=repo_dir, capture_output=True,
+        )
+
+        # Modify and stage
+        nested_file.write_text("modified: true")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "restore", "--staged", "config/app/settings.yaml"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "M  config/app/settings.yaml" not in status_result.stdout

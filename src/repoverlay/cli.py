@@ -143,6 +143,10 @@ def main() -> int:
         help="Preview changes without executing",
     )
 
+    restore_parser = subparsers.add_parser("restore", help="Restore files in overlay repo")
+    restore_parser.add_argument("--staged", "-S", action="store_true", help="Restore staged changes (unstage)")
+    restore_parser.add_argument("files", nargs="+", help="Files to restore")
+
     reset_parser = subparsers.add_parser("reset", help="Unstage files from overlay repo")
     reset_parser.add_argument("files", nargs="*", help="Files to unstage (default: all staged files)")
 
@@ -184,6 +188,7 @@ def main() -> int:
         "commit": lambda: cmd_commit(args, output),
         "add": lambda: cmd_add(args, output),
         "import": lambda: cmd_import(args, output),
+        "restore": lambda: cmd_restore(args, output),
         "reset": lambda: cmd_reset(args, output),
         "diff": lambda: cmd_diff(args, output),
         "log": lambda: cmd_log(args, output),
@@ -704,6 +709,7 @@ def cmd_add(args, output: Output) -> int:
     # Files already in repo just need to be staged, no copy/encrypt needed
     files_in_repo = []
     files_external = []
+    decoded_dir = get_decoded_dir(root_dir)
 
     for file_path in args.files:
         path = Path(file_path)
@@ -722,6 +728,19 @@ def cmd_add(args, output: Output) -> int:
 
         # For absolute paths, check if they're inside the repo
         abs_path = path.resolve() if path.is_absolute() else (Path.cwd() / file_path).resolve()
+
+        # Check if the resolved path is inside the decoded directory
+        # (e.g., file is a symlink to .repoverlay/decoded/something)
+        # If so, map it back to the corresponding .enc file in the repo
+        try:
+            rel_to_decoded = abs_path.relative_to(decoded_dir)
+            enc_name = str(rel_to_decoded) + ".enc"
+            if (repo_dir / enc_name).exists():
+                files_in_repo.append(enc_name)
+                continue
+        except ValueError:
+            pass
+
         try:
             rel_to_repo = abs_path.relative_to(repo_dir)
             # File is inside repo
@@ -812,12 +831,17 @@ def cmd_add(args, output: Output) -> int:
             try:
                 rel_path = src_path.relative_to(repo_dir)
             except ValueError:
-                # File is outside repo_dir, try relative to root_dir
+                # Check if file is inside decoded dir (e.g., symlink target)
+                # If so, use the decoded-relative path to find the correct .enc file
                 try:
-                    rel_path = src_path.relative_to(root_dir)
+                    rel_path = src_path.relative_to(decoded_dir)
                 except ValueError:
-                    # File is outside project, use basename
-                    rel_path = Path(src_path.name)
+                    # File is outside repo_dir, try relative to root_dir
+                    try:
+                        rel_path = src_path.relative_to(root_dir)
+                    except ValueError:
+                        # File is outside project, use basename
+                        rel_path = Path(src_path.name)
 
             enc_filename = str(rel_path) + ".enc"
             enc_dst = repo_dir / enc_filename
@@ -882,12 +906,16 @@ def cmd_add(args, output: Output) -> int:
                 files_to_stage.append(str(rel_path))
             except ValueError:
                 # File is outside repo_dir, need to copy it in
-                # Try to get relative path from root_dir (project root)
+                # Check if inside decoded dir first (e.g., symlink target)
                 try:
-                    rel_path = src_path.relative_to(root_dir)
+                    rel_path = src_path.relative_to(decoded_dir)
                 except ValueError:
-                    # File is completely outside the project, use basename
-                    rel_path = Path(src_path.name)
+                    # Try relative to root_dir (project root)
+                    try:
+                        rel_path = src_path.relative_to(root_dir)
+                    except ValueError:
+                        # File is completely outside the project, use basename
+                        rel_path = Path(src_path.name)
 
                 # Copy file into repo_dir
                 dst_path = repo_dir / rel_path
@@ -1129,6 +1157,66 @@ def cmd_import(args, output: Output) -> int:
 
     output.success(f"Imported {len(new_symlinks)} file(s) into overlay repo.")
     return 0
+
+
+def cmd_restore(args, output: Output) -> int:
+    """Execute git restore in overlay repo."""
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, root_dir = result
+
+    from pathlib import Path
+
+    files_to_restore = []
+
+    for file_path in args.files:
+        path = Path(file_path)
+
+        # For relative paths, first check if they exist directly in repo
+        if not path.is_absolute():
+            repo_path = repo_dir / file_path
+            repo_path_enc = repo_dir / (file_path + ".enc")
+
+            if repo_path.exists():
+                files_to_restore.append(file_path)
+                continue
+            elif repo_path_enc.exists():
+                files_to_restore.append(file_path + ".enc")
+                continue
+
+        # Handle absolute paths or paths not found in repo
+        abs_path = path.resolve() if path.is_absolute() else (Path.cwd() / file_path).resolve()
+
+        # Try to get path relative to repo_dir
+        try:
+            rel_path = abs_path.relative_to(repo_dir)
+        except ValueError:
+            # File is outside repo_dir, try relative to root_dir
+            try:
+                rel_path = abs_path.relative_to(root_dir)
+            except ValueError:
+                # Use basename as fallback
+                rel_path = Path(abs_path.name)
+
+        # Check if file exists in repo, if not try with .enc suffix
+        repo_file = repo_dir / rel_path
+        if repo_file.exists():
+            files_to_restore.append(str(rel_path))
+        elif (repo_dir / (str(rel_path) + ".enc")).exists():
+            files_to_restore.append(str(rel_path) + ".enc")
+        else:
+            # File doesn't exist, try it anyway (git will error if invalid)
+            files_to_restore.append(str(rel_path))
+
+    try:
+        git.restore(repo_dir, files_to_restore, staged=args.staged)
+        action = "Unstaged" if args.staged else "Restored"
+        output.success(f"{action} {len(files_to_restore)} file(s).")
+        return 0
+    except git.GitError as e:
+        output.error(str(e))
+        return 1
 
 
 def cmd_reset(args, output: Output) -> int:
