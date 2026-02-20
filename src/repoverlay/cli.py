@@ -1,7 +1,9 @@
 """Command-line interface."""
 
 import argparse
+import subprocess
 import sys
+import tempfile
 
 from . import __version__, git, sops
 from .config import ConfigError, find_config, load_config
@@ -107,7 +109,8 @@ def main() -> int:
     )
 
     # Git passthrough commands
-    subparsers.add_parser("status", help="Show git status of overlay repo")
+    status_parser = subparsers.add_parser("status", help="Show git status of overlay repo")
+    status_parser.add_argument("--debug", action="store_true", help="Show debug info for encrypted file detection")
     subparsers.add_parser("fetch", help="Fetch updates from overlay remote")
 
     pull_parser = subparsers.add_parser("pull", help="Pull updates and sync symlinks")
@@ -166,6 +169,14 @@ def main() -> int:
     # list command
     subparsers.add_parser("list", help="List files in overlay repo")
 
+    # repair command
+    repair_parser = subparsers.add_parser("repair", help="Rebuild state from filesystem")
+    repair_parser.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="Preview changes without executing",
+    )
+
     args = parser.parse_args()
 
     # Set up output handler
@@ -181,7 +192,7 @@ def main() -> int:
         "clone": lambda: cmd_clone(args, output),
         "sync": lambda: cmd_sync(args, output),
         "unlink": lambda: cmd_unlink(args, output),
-        "status": lambda: cmd_status(output),
+        "status": lambda: cmd_status(args, output),
         "fetch": lambda: cmd_fetch(output),
         "pull": lambda: cmd_pull(args, output),
         "push": lambda: cmd_push(output),
@@ -195,6 +206,7 @@ def main() -> int:
         "checkout": lambda: cmd_checkout(args, output),
         "merge": lambda: cmd_merge(args, output),
         "list": lambda: cmd_list(output),
+        "repair": lambda: cmd_repair(args, output),
     }
 
     handler = handlers.get(args.command)
@@ -419,8 +431,9 @@ def cmd_unlink(args, output: Output) -> int:
     return 0
 
 
-def cmd_status(output: Output) -> int:
+def cmd_status(args, output: Output) -> int:
     """Execute git status in overlay repo."""
+    debug = getattr(args, 'debug', False)
     result = _get_repo_dir_or_error(output)
     if result is None:
         return 1
@@ -441,7 +454,61 @@ def cmd_status(output: Output) -> int:
             output.info("Run: git rm --cached " + " ".join(tracked))
             output.info("")
 
-    return git.status(repo_dir).returncode
+    # Check for changes to decoded (encrypted) files
+    encrypted_files = state.get("encrypted_files", {})
+    if debug:
+        output.info(f"[debug] root_dir={root_dir}")
+        output.info(f"[debug] repo_dir={repo_dir}")
+        output.info(f"[debug] encrypted_files keys={list(encrypted_files.keys())}")
+        output.info(f"[debug] encrypted_files count={len(encrypted_files)}")
+    if encrypted_files:
+        cfg_result = _get_config_and_root(output)
+        config = cfg_result[0] if cfg_result else None
+        decoded_dir = get_decoded_dir(root_dir)
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+        if debug:
+            output.info(f"[debug] decoded_dir={decoded_dir}, exists={decoded_dir.exists()}")
+            output.info(f"[debug] sops_config={sops_config}")
+
+            # Debug: list decoded dir contents
+            if decoded_dir.exists():
+                decoded_files = list(decoded_dir.rglob("*"))
+                output.info(f"[debug] decoded_dir contents: {[str(f.relative_to(decoded_dir)) for f in decoded_files if f.is_file()]}")
+
+            # Debug: list encrypted files in repo
+            for enc_path_str, metadata in encrypted_files.items():
+                enc_src = repo_dir / enc_path_str
+                decoded_path = decoded_dir / metadata.get("decoded_path", "")
+                output.info(f"[debug] enc={enc_path_str} exists={enc_src.exists()}, decoded={metadata.get('decoded_path')} exists={decoded_path.exists()}")
+
+        try:
+            changed = sops.detect_decoded_changes(
+                decoded_dir, repo_dir, encrypted_files, sops_config, debug=debug
+            )
+            if debug:
+                output.info(f"[debug] detect_decoded_changes returned: {changed}")
+        except sops.SopsError as e:
+            output.error(f"Could not check decoded file changes: {e}")
+            changed = []
+    else:
+        changed = []
+    if debug and not encrypted_files:
+        output.info("[debug] No encrypted_files in state")
+
+    # Convert changed encrypted paths to decoded paths for display
+    extra_unstaged = []
+    for enc_path in changed:
+        metadata = encrypted_files.get(enc_path, {})
+        decoded_name = metadata.get("decoded_path", enc_path)
+        extra_unstaged.append(decoded_name)
+
+    # Run git status with decrypted file changes injected
+    returncode = git.status(repo_dir, root_dir, extra_unstaged).returncode
+
+    if debug and not changed:
+        output.info("[debug] No decoded file changes detected")
+
+    return returncode
 
 
 def cmd_list(output: Output) -> int:
@@ -705,42 +772,35 @@ def cmd_add(args, output: Output) -> int:
 
     from pathlib import Path
 
-    # First pass: separate files that already exist in repo from external files
-    # Files already in repo just need to be staged, no copy/encrypt needed
+    # First pass: categorize files
+    # - files_in_repo: plain files in repo that just need staging
+    # - files_to_reencrypt: decoded files that need re-encryption before staging
+    # - files_external: files outside both decoded and repo dirs
     files_in_repo = []
+    files_to_reencrypt = []  # List of (enc_name, decoded_path) tuples
     files_external = []
     decoded_dir = get_decoded_dir(root_dir)
 
     for file_path in args.files:
         path = Path(file_path)
 
-        # For relative paths, check if they exist directly in repo
-        if not path.is_absolute():
-            repo_path = repo_dir / file_path
-            repo_path_enc = repo_dir / (file_path + ".enc")
-
-            if repo_path.exists():
-                files_in_repo.append(file_path)
-                continue
-            elif repo_path_enc.exists():
-                files_in_repo.append(file_path + ".enc")
-                continue
-
-        # For absolute paths, check if they're inside the repo
+        # Resolve to absolute path to handle all path types uniformly
         abs_path = path.resolve() if path.is_absolute() else (Path.cwd() / file_path).resolve()
 
         # Check if the resolved path is inside the decoded directory
-        # (e.g., file is a symlink to .repoverlay/decoded/something)
-        # If so, map it back to the corresponding .enc file in the repo
+        # (e.g., file is a symlink to .repoverlay/decoded/something, or user specified
+        # a path like ../../.repoverlay/decoded/...)
+        # If so, we need to re-encrypt before staging
         try:
             rel_to_decoded = abs_path.relative_to(decoded_dir)
             enc_name = str(rel_to_decoded) + ".enc"
             if (repo_dir / enc_name).exists():
-                files_in_repo.append(enc_name)
+                files_to_reencrypt.append((enc_name, abs_path))
                 continue
         except ValueError:
             pass
 
+        # Check if path is inside the repo directory (absolute path resolves there)
         try:
             rel_to_repo = abs_path.relative_to(repo_dir)
             # File is inside repo
@@ -753,11 +813,61 @@ def cmd_add(args, output: Output) -> int:
                     files_in_repo.append(str(rel_to_repo) + ".enc")
                 else:
                     files_external.append(file_path)
+            continue
         except ValueError:
-            # File is outside repo
-            files_external.append(file_path)
+            pass
 
-    # Stage files that are already in repo
+        # For relative paths, also check if they exist directly in repo
+        # (user may specify repo-relative paths like "secrets/db.yaml")
+        if not path.is_absolute():
+            repo_path = repo_dir / file_path
+            repo_path_enc = repo_dir / (file_path + ".enc")
+
+            if repo_path.exists():
+                files_in_repo.append(file_path)
+                continue
+            elif repo_path_enc.exists():
+                files_in_repo.append(file_path + ".enc")
+                continue
+
+        # File is outside both decoded and repo directories - it's external
+        files_external.append(file_path)
+
+    # Re-encrypt decoded files before staging
+    if files_to_reencrypt:
+        cfg_result = _get_config_and_root(output)
+        config = cfg_result[0] if cfg_result else None
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+        state = read_state(root_dir)
+        encrypted_files = state.get("encrypted_files", {})
+
+        reencrypted_paths = []
+        for enc_name, decoded_path in files_to_reencrypt:
+            enc_dst = repo_dir / enc_name
+            try:
+                sops.encrypt_file(decoded_path, enc_dst, sops_config)
+                output.info(f"Re-encrypted: {output.path(enc_name)}")
+                reencrypted_paths.append(enc_name)
+
+                # Update state with new hashes (both encrypted and decoded)
+                rel_decoded = str(decoded_path.relative_to(decoded_dir))
+                encrypted_files[enc_name] = {
+                    "decoded_path": rel_decoded,
+                    "symlink_dst": rel_decoded,
+                    "last_encrypted_hash": sops.file_hash(enc_dst),
+                    "last_decoded_hash": sops.file_hash(decoded_path),
+                }
+            except sops.SopsError as e:
+                output.error(f"Failed to re-encrypt {enc_name}: {e}")
+                return 1
+
+        # Update state
+        if reencrypted_paths:
+            state["encrypted_files"] = encrypted_files
+            write_state(root_dir, state)
+            files_in_repo.extend(reencrypted_paths)
+
+    # Stage files that are already in repo (including re-encrypted ones)
     if files_in_repo:
         try:
             git.add(repo_dir, files_in_repo)
@@ -1293,12 +1403,66 @@ def cmd_reset(args, output: Output) -> int:
 
 def cmd_diff(args, output: Output) -> int:
     """Execute git diff in overlay repo."""
+    from pathlib import Path
+
     result = _get_repo_dir_or_error(output)
     if result is None:
         return 1
-    repo_dir, _ = result
+    repo_dir, root_dir = result
 
-    return git.diff(repo_dir, args.args if args.args else None).returncode
+    returncode = git.diff(repo_dir, args.args if args.args else None).returncode
+
+    # Show diffs for modified decoded (encrypted) files
+    state = read_state(root_dir)
+    encrypted_files = state.get("encrypted_files", {})
+    if encrypted_files:
+        cfg_result = _get_config_and_root(output)
+        config = cfg_result[0] if cfg_result else None
+        decoded_dir = get_decoded_dir(root_dir)
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+
+        try:
+            changed = sops.detect_decoded_changes(
+                decoded_dir, repo_dir, encrypted_files, sops_config
+            )
+            if changed:
+                output.warning("\nChanges not staged for commit (decrypted files):")
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = Path(tmp_dir)
+                    for enc_path in changed:
+                        metadata = encrypted_files.get(enc_path, {})
+                        decoded_name = metadata.get("decoded_path", enc_path)
+                        decoded_file = decoded_dir / decoded_name
+                        enc_src = repo_dir / enc_path
+
+                        if not decoded_file.exists() or not enc_src.exists():
+                            continue
+
+                        # Decrypt encrypted source to temp file for comparison
+                        tmp_decrypted = tmp_path / decoded_name
+                        tmp_decrypted.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            sops.decrypt_file(enc_src, tmp_decrypted, sops_config)
+                        except sops.SopsError as e:
+                            output.error(f"Could not decrypt {enc_path} for diff: {e}")
+                            continue
+
+                        # Run diff between decrypted original and current decoded file
+                        diff_result = subprocess.run(
+                            ["diff", "-u",
+                             "--label", f"a/{decoded_name} (encrypted)",
+                             "--label", f"b/{decoded_name} (decoded)",
+                             str(tmp_decrypted), str(decoded_file)],
+                            capture_output=True,
+                            text=True,
+                        )
+                        if diff_result.stdout:
+                            print(diff_result.stdout)
+
+        except sops.SopsError as e:
+            output.error(f"Could not check decoded file changes: {e}")
+
+    return returncode
 
 
 def cmd_log(args, output: Output) -> int:
@@ -1363,6 +1527,138 @@ def cmd_merge(args, output: Output) -> int:
     except OverlayError as e:
         output.error(str(e))
         return 1
+
+
+def cmd_repair(args, output: Output) -> int:
+    """Rebuild state from filesystem.
+
+    Scans the overlay repo and decoded directory to rebuild the state file.
+    Useful when state is corrupted or destroyed.
+    """
+    import os
+    from pathlib import Path
+
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, root_dir = result
+
+    decoded_dir = get_decoded_dir(root_dir)
+    dry_run = args.dry_run
+
+    output.info("Scanning filesystem to rebuild state...")
+
+    # 1. Scan for encrypted files in the repo
+    encrypted_files = {}
+    enc_file_paths = sops.scan_encrypted_files(repo_dir)
+
+    if enc_file_paths:
+        output.info(f"Found {len(enc_file_paths)} encrypted file(s)")
+
+        # Load config for SOPS config path
+        cfg_result = _get_config_and_root(output)
+        config = cfg_result[0] if cfg_result else None
+        sops_config = sops.get_sops_config_path(repo_dir, config)
+
+        for enc_path in enc_file_paths:
+            enc_path_str = str(enc_path)
+            enc_src = repo_dir / enc_path
+            decoded_name = sops.get_decoded_path(enc_path_str)
+            decoded_file = decoded_dir / decoded_name
+
+            metadata = {
+                "decoded_path": decoded_name,
+                "symlink_dst": decoded_name,
+                "last_encrypted_hash": sops.file_hash(enc_src),
+            }
+
+            # If decoded file exists, compute its hash
+            if decoded_file.exists():
+                metadata["last_decoded_hash"] = sops.file_hash(decoded_file)
+                output.info(f"  {enc_path_str} -> {decoded_name} (decoded exists)")
+            else:
+                # Try to decrypt it
+                if not dry_run and sops.is_sops_available():
+                    try:
+                        decoded_file.parent.mkdir(parents=True, exist_ok=True)
+                        sops.decrypt_file(enc_src, decoded_file, sops_config)
+                        metadata["last_decoded_hash"] = sops.file_hash(decoded_file)
+                        output.info(f"  {enc_path_str} -> {decoded_name} (decrypted)")
+                    except sops.SopsError as e:
+                        output.warning(f"  {enc_path_str} -> could not decrypt: {e}")
+                else:
+                    output.info(f"  {enc_path_str} -> {decoded_name} (not decrypted)")
+
+            encrypted_files[enc_path_str] = metadata
+
+    # 2. Scan for symlinks in the root directory pointing to overlay repo or decoded dir
+    symlinks = []
+    created_dirs = set()
+
+    def scan_for_symlinks(directory: Path, base: Path):
+        """Recursively scan for symlinks pointing to overlay."""
+        for item in directory.iterdir():
+            if item.name.startswith("."):
+                # Skip hidden directories like .git, .repoverlay
+                continue
+
+            if item.is_symlink():
+                target = item.resolve()
+                # Check if symlink points to repo_dir or decoded_dir
+                try:
+                    target.relative_to(repo_dir)
+                    is_overlay_symlink = True
+                except ValueError:
+                    try:
+                        target.relative_to(decoded_dir)
+                        is_overlay_symlink = True
+                    except ValueError:
+                        is_overlay_symlink = False
+
+                if is_overlay_symlink:
+                    rel_path = str(item.relative_to(base))
+                    symlinks.append(rel_path)
+                    # Track parent directories
+                    parent = item.parent
+                    while parent != base:
+                        try:
+                            rel_parent = str(parent.relative_to(base))
+                            created_dirs.add(rel_parent)
+                        except ValueError:
+                            break
+                        parent = parent.parent
+
+            elif item.is_dir():
+                scan_for_symlinks(item, base)
+
+    scan_for_symlinks(root_dir, root_dir)
+
+    output.info(f"Found {len(symlinks)} symlink(s) pointing to overlay")
+    for sl in symlinks:
+        output.info(f"  {sl}")
+
+    if created_dirs:
+        output.info(f"Found {len(created_dirs)} directory(ies) created for symlinks")
+
+    # 3. Build new state
+    new_state = {
+        "symlinks": sorted(symlinks),
+        "created_directories": sorted(created_dirs),
+        "encrypted_files": encrypted_files,
+    }
+
+    if dry_run:
+        output.info(f"{output.dry_run_prefix()} Would write state with:")
+        output.info(f"  {len(symlinks)} symlinks")
+        output.info(f"  {len(created_dirs)} directories")
+        output.info(f"  {len(encrypted_files)} encrypted files")
+        return 0
+
+    # 4. Write state
+    write_state(root_dir, new_state)
+    output.success(f"State rebuilt: {len(symlinks)} symlinks, {len(encrypted_files)} encrypted files")
+
+    return 0
 
 
 if __name__ == "__main__":

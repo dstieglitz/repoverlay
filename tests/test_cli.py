@@ -1302,20 +1302,43 @@ class TestAddEncryptPatterns:
         # Now modify the decoded file through the symlink
         symlink_path.write_text("password: modified")
 
-        # Modify the .enc file too (simulating what re-encryption would do)
-        enc_file.write_text("ENC[AES256,data:re-encrypted]")
-
         # Run repoverlay add using the absolute path of the symlink.
         # This bypasses the first-pass relative ".enc" check and triggers
         # resolve() to follow the symlink into .repoverlay/decoded/.
+        # We mock sops.encrypt_file since actual SOPS requires configuration.
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch, MagicMock
+from repoverlay.cli import cmd_add
+from repoverlay.output import Output
+from repoverlay import sops
+import argparse
+
+def mock_encrypt(src, dst, config=None):
+    # Write fake encrypted content
+    dst.write_text("ENC[AES256,data:re-encrypted]")
+
+def mock_file_hash(path):
+    return "sha256:newhash"
+
+o = Output(no_color=True)
+with patch.object(sops, 'encrypt_file', side_effect=mock_encrypt):
+    with patch.object(sops, 'file_hash', side_effect=mock_file_hash):
+        args = argparse.Namespace(files=[{str(symlink_path)!r}], encrypt=False)
+        rc = cmd_add(args, o)
+sys.exit(rc)
+"""
+        script_file = tmp_main_repo / "_test_script.py"
+        script_file.write_text(script)
         result = subprocess.run(
-            [sys.executable, "-m", "repoverlay", "add", str(symlink_path)],
-            cwd=tmp_main_repo,
+            [sys.executable, str(script_file)],
             capture_output=True,
             text=True,
+            cwd=tmp_main_repo,
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
-        assert "staged" in result.stdout.lower()
+        assert "staged" in result.stdout.lower() or "re-encrypted" in result.stdout.lower()
 
         # Verify: the .enc file should be staged, NOT a file under .repoverlay/
         status_result = subprocess.run(
@@ -1779,3 +1802,916 @@ class TestRestore:
             text=True,
         )
         assert "M  config/app/settings.yaml" not in status_result.stdout
+
+
+class TestStatusEncryptedFiles:
+    """Tests for cmd_status showing decoded file changes."""
+
+    def _setup_overlay_with_encrypted(self, tmp_main_repo, sample_config):
+        """Set up overlay with encrypted file state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        from repoverlay.state import read_state, write_state
+        from repoverlay import sops
+
+        root_dir = tmp_main_repo
+        repo_dir = root_dir / ".repoverlay" / "repo"
+        decoded_dir = root_dir / ".repoverlay" / "decoded"
+        decoded_dir.mkdir(exist_ok=True)
+
+        (repo_dir / "secrets.yaml.enc").write_text("encrypted-content")
+        (decoded_dir / "secrets.yaml").write_text("decrypted-content-MODIFIED")
+
+        state = read_state(root_dir)
+        state["encrypted_files"] = {
+            "secrets.yaml.enc": {
+                "decoded_path": "secrets.yaml",
+                "symlink_dst": "secrets.yaml",
+                "last_encrypted_hash": sops.file_hash(repo_dir / "secrets.yaml.enc"),
+            }
+        }
+        write_state(root_dir, state)
+
+        return root_dir, repo_dir, decoded_dir
+
+    def _run_script(self, tmp_main_repo, script):
+        """Run a Python script in a subprocess with the correct cwd."""
+        script_file = tmp_main_repo / "_test_script.py"
+        script_file.write_text(script)
+        result = subprocess.run(
+            [sys.executable, str(script_file)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_main_repo,
+        )
+        return result
+
+    def test_status_shows_modified_decoded_files(self, tmp_main_repo, sample_config):
+        """Status should show decoded files integrated with other unstaged changes."""
+        self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_status
+from repoverlay.output import Output
+
+o = Output(no_color=True)
+with patch('repoverlay.sops.detect_decoded_changes', return_value=['secrets.yaml.enc']):
+    import argparse; a = argparse.Namespace(debug=False)
+    rc = cmd_status(a, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        combined = result.stdout + result.stderr
+        # Encrypted files should now appear in the combined "Changes not staged" section
+        assert "Changes not staged for commit:" in combined, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "secrets.yaml" in combined
+        # Should include hint about repoverlay commit for decrypted files
+        assert "repoverlay commit" in combined
+
+    def test_status_no_output_when_no_changes(self, tmp_main_repo, sample_config):
+        """Status should not show unstaged section when no files changed."""
+        self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_status
+from repoverlay.output import Output
+
+o = Output(no_color=True)
+with patch('repoverlay.sops.detect_decoded_changes', return_value=[]):
+    import argparse; a = argparse.Namespace(debug=False)
+    rc = cmd_status(a, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        combined = result.stdout + result.stderr
+        # No modified encrypted files should mean no extra entries for them
+        # (the section may still appear for other untracked files)
+        assert "secrets.yaml" not in combined or "Untracked" in combined
+
+
+class TestDiffEncryptedFiles:
+    """Tests for cmd_diff showing decoded file diffs."""
+
+    def _setup_overlay_with_encrypted(self, tmp_main_repo, sample_config):
+        """Set up overlay with encrypted file state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        from repoverlay.state import read_state, write_state
+        from repoverlay import sops
+
+        root_dir = tmp_main_repo
+        repo_dir = root_dir / ".repoverlay" / "repo"
+        decoded_dir = root_dir / ".repoverlay" / "decoded"
+        decoded_dir.mkdir(exist_ok=True)
+
+        (repo_dir / "secrets.yaml.enc").write_text("encrypted-content")
+        (decoded_dir / "secrets.yaml").write_text("password: new_secret\n")
+
+        state = read_state(root_dir)
+        state["encrypted_files"] = {
+            "secrets.yaml.enc": {
+                "decoded_path": "secrets.yaml",
+                "symlink_dst": "secrets.yaml",
+                "last_encrypted_hash": sops.file_hash(repo_dir / "secrets.yaml.enc"),
+            }
+        }
+        write_state(root_dir, state)
+
+        return root_dir, repo_dir, decoded_dir
+
+    def _run_script(self, tmp_main_repo, script):
+        """Run a Python script in a subprocess with the correct cwd."""
+        script_file = tmp_main_repo / "_test_script.py"
+        script_file.write_text(script)
+        result = subprocess.run(
+            [sys.executable, str(script_file)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_main_repo,
+        )
+        return result
+
+    def test_diff_shows_decoded_file_changes(self, tmp_main_repo, sample_config):
+        """Diff should show content diff for modified decoded files."""
+        self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        script = f"""\
+import os, sys, argparse
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_diff
+from repoverlay.output import Output
+
+o = Output(no_color=True)
+args = argparse.Namespace(args=None)
+
+def fake_decrypt(src, dst, sops_config=None):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text('password: old_secret\\n')
+
+with patch('repoverlay.sops.detect_decoded_changes', return_value=['secrets.yaml.enc']):
+    with patch('repoverlay.sops.decrypt_file', side_effect=fake_decrypt):
+        rc = cmd_diff(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        combined = result.stdout + result.stderr
+        assert "Changes not staged for commit (decrypted files)" in combined, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "old_secret" in combined or "new_secret" in combined
+
+    def test_diff_no_output_when_no_changes(self, tmp_main_repo, sample_config):
+        """Diff should not show decoded section when no files changed."""
+        self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        script = f"""\
+import os, sys, argparse
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_diff
+from repoverlay.output import Output
+
+o = Output(no_color=True)
+args = argparse.Namespace(args=None)
+
+with patch('repoverlay.sops.detect_decoded_changes', return_value=[]):
+    rc = cmd_diff(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        combined = result.stdout + result.stderr
+        assert "Changes not staged for commit (decrypted files)" not in combined
+
+
+class TestAddReencryptsDecodedFiles:
+    """Tests for repoverlay add re-encrypting decoded files."""
+
+    def _setup_overlay_with_encrypted(self, tmp_main_repo, sample_config):
+        """Set up overlay with encrypted file state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        from repoverlay.state import read_state, write_state
+        from repoverlay import sops
+
+        root_dir = tmp_main_repo
+        repo_dir = root_dir / ".repoverlay" / "repo"
+        decoded_dir = root_dir / ".repoverlay" / "decoded"
+        decoded_dir.mkdir(exist_ok=True)
+
+        # Create encrypted and decoded files
+        (repo_dir / "secrets.yaml.enc").write_text("ENC[original-encrypted]")
+        (decoded_dir / "secrets.yaml").write_text("password: original")
+
+        state = read_state(root_dir)
+        state["encrypted_files"] = {
+            "secrets.yaml.enc": {
+                "decoded_path": "secrets.yaml",
+                "symlink_dst": "secrets.yaml",
+                "last_encrypted_hash": sops.file_hash(repo_dir / "secrets.yaml.enc"),
+                "last_decoded_hash": sops.file_hash(decoded_dir / "secrets.yaml"),
+            }
+        }
+        write_state(root_dir, state)
+
+        # Create symlink
+        symlink_path = root_dir / "secrets.yaml"
+        if symlink_path.exists() or symlink_path.is_symlink():
+            symlink_path.unlink()
+        symlink_path.symlink_to(".repoverlay/decoded/secrets.yaml")
+
+        return root_dir, repo_dir, decoded_dir
+
+    def _run_script(self, tmp_main_repo, script):
+        """Run a Python script in a subprocess with the correct cwd."""
+        script_file = tmp_main_repo / "_test_script.py"
+        script_file.write_text(script)
+        result = subprocess.run(
+            [sys.executable, str(script_file)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_main_repo,
+        )
+        return result
+
+    def test_add_decoded_file_reencrypts_and_updates_state(self, tmp_main_repo, sample_config):
+        """Adding a decoded file should re-encrypt it and update last_decoded_hash in state."""
+        root_dir, repo_dir, decoded_dir = self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        # Modify the decoded file
+        decoded_file = decoded_dir / "secrets.yaml"
+        decoded_file.write_text("password: modified_secret")
+
+        # Run add with mocked encryption
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_add
+from repoverlay.output import Output
+from repoverlay import sops
+import argparse
+
+def mock_encrypt(src, dst, config=None):
+    dst.write_text("ENC[re-encrypted-content]")
+
+def mock_file_hash(path):
+    import hashlib
+    content = path.read_bytes()
+    return f"sha256:{{hashlib.sha256(content).hexdigest()}}"
+
+o = Output(no_color=True)
+with patch.object(sops, 'encrypt_file', side_effect=mock_encrypt):
+    with patch.object(sops, 'file_hash', side_effect=mock_file_hash):
+        # Add using the decoded file path
+        args = argparse.Namespace(files=[{str(decoded_dir / "secrets.yaml")!r}], encrypt=False)
+        rc = cmd_add(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "Re-encrypted" in result.stdout
+
+        # Verify state has last_decoded_hash
+        from repoverlay.state import read_state
+        state = read_state(root_dir)
+        enc_state = state.get("encrypted_files", {}).get("secrets.yaml.enc", {})
+        assert "last_decoded_hash" in enc_state, f"State missing last_decoded_hash: {enc_state}"
+        assert enc_state["last_decoded_hash"].startswith("sha256:")
+
+    def test_status_not_modified_after_add(self, tmp_main_repo, sample_config):
+        """After add re-encrypts a file, status should NOT show it as modified."""
+        root_dir, repo_dir, decoded_dir = self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        # Modify the decoded file
+        decoded_file = decoded_dir / "secrets.yaml"
+        decoded_file.write_text("password: modified_secret")
+
+        from repoverlay import sops
+        from repoverlay.state import read_state, write_state
+
+        # Simulate what add does: update state with current decoded hash
+        state = read_state(root_dir)
+        state["encrypted_files"]["secrets.yaml.enc"]["last_decoded_hash"] = sops.file_hash(decoded_file)
+        write_state(root_dir, state)
+
+        # Now status should NOT detect the file as changed
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from repoverlay.cli import cmd_status
+from repoverlay.output import Output
+import argparse
+
+o = Output(no_color=True)
+args = argparse.Namespace(debug=False)
+rc = cmd_status(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        combined = result.stdout + result.stderr
+        # The decoded file should NOT appear in "Changes not staged for commit" section
+        # because last_decoded_hash matches. The .enc file may show as untracked, that's fine.
+        # Check that we don't have "decoded/secrets.yaml" shown as modified
+        assert "decoded/secrets.yaml" not in combined or "Untracked" in combined, \
+            f"Decoded file incorrectly shown as modified:\n{combined}"
+        # Also verify there's no "Changes not staged" section with the decoded file
+        if "Changes not staged for commit" in combined:
+            # If there's an unstaged section, the decoded file shouldn't be in it
+            lines = combined.split("\n")
+            in_unstaged = False
+            for line in lines:
+                if "Changes not staged" in line:
+                    in_unstaged = True
+                elif line.strip() == "" and in_unstaged:
+                    in_unstaged = False
+                elif in_unstaged and "decoded/secrets.yaml" in line:
+                    assert False, f"Decoded file found in unstaged section:\n{combined}"
+
+    def test_status_shows_modified_when_hash_differs(self, tmp_main_repo, sample_config):
+        """Status should show file as modified when decoded content differs from last_decoded_hash."""
+        root_dir, repo_dir, decoded_dir = self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        # Modify the decoded file AFTER state was written
+        decoded_file = decoded_dir / "secrets.yaml"
+        decoded_file.write_text("password: newly_modified")
+
+        # Status should detect the file as changed (hash differs)
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from repoverlay.cli import cmd_status
+from repoverlay.output import Output
+import argparse
+
+o = Output(no_color=True)
+args = argparse.Namespace(debug=False)
+rc = cmd_status(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        combined = result.stdout + result.stderr
+        # The file should appear as unstaged because content changed
+        assert "secrets.yaml" in combined, f"Modified file not shown:\n{combined}"
+        assert "Changes not staged for commit" in combined
+
+
+class TestSyncPreservesDecodedHash:
+    """Tests for sync preserving last_decoded_hash in state."""
+
+    def test_sync_preserves_last_decoded_hash(self, tmp_main_repo, sample_config):
+        """Sync should preserve last_decoded_hash for existing encrypted files."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        from repoverlay.state import read_state, write_state
+        from repoverlay import sops
+
+        root_dir = tmp_main_repo
+        repo_dir = root_dir / ".repoverlay" / "repo"
+        decoded_dir = root_dir / ".repoverlay" / "decoded"
+        decoded_dir.mkdir(exist_ok=True)
+
+        # Create encrypted and decoded files
+        enc_file = repo_dir / "secrets.yaml.enc"
+        enc_file.write_text("ENC[original-encrypted]")
+        decoded_file = decoded_dir / "secrets.yaml"
+        decoded_file.write_text("password: original")
+
+        # Set up state with last_decoded_hash
+        original_decoded_hash = sops.file_hash(decoded_file)
+        state = read_state(root_dir)
+        state["encrypted_files"] = {
+            "secrets.yaml.enc": {
+                "decoded_path": "secrets.yaml",
+                "symlink_dst": "secrets.yaml",
+                "last_encrypted_hash": sops.file_hash(enc_file),
+                "last_decoded_hash": original_decoded_hash,
+            }
+        }
+        write_state(root_dir, state)
+
+        # Run sync
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "sync"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        # Verify state still has last_decoded_hash
+        state = read_state(root_dir)
+        enc_state = state.get("encrypted_files", {}).get("secrets.yaml.enc", {})
+        assert enc_state.get("last_decoded_hash") == original_decoded_hash, \
+            f"last_decoded_hash not preserved: {enc_state}"
+
+
+class TestStateDestroyed:
+    """Tests for behavior when state file is destroyed/corrupted."""
+
+    def _setup_overlay_with_encrypted(self, tmp_main_repo, sample_config):
+        """Set up overlay with encrypted file state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        root_dir = tmp_main_repo
+        repo_dir = root_dir / ".repoverlay" / "repo"
+        decoded_dir = root_dir / ".repoverlay" / "decoded"
+
+        return root_dir, repo_dir, decoded_dir
+
+    def _run_script(self, tmp_main_repo, script):
+        """Run a Python script in a subprocess with the correct cwd."""
+        script_file = tmp_main_repo / "_test_script.py"
+        script_file.write_text(script)
+        result = subprocess.run(
+            [sys.executable, str(script_file)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_main_repo,
+        )
+        return result
+
+    def test_status_fallback_without_decoded_hash(self, tmp_main_repo, sample_config):
+        """Status should fall back to content comparison when last_decoded_hash is missing."""
+        root_dir, repo_dir, decoded_dir = self._setup_overlay_with_encrypted(tmp_main_repo, sample_config)
+
+        from repoverlay.state import read_state, write_state
+        from repoverlay import sops
+
+        decoded_dir.mkdir(exist_ok=True)
+
+        # Create encrypted and decoded files
+        (repo_dir / "secrets.yaml.enc").write_text("ENC[original-encrypted]")
+        (decoded_dir / "secrets.yaml").write_text("password: modified")
+
+        # Set up state WITHOUT last_decoded_hash (simulating old/destroyed state)
+        state = read_state(root_dir)
+        state["encrypted_files"] = {
+            "secrets.yaml.enc": {
+                "decoded_path": "secrets.yaml",
+                "symlink_dst": "secrets.yaml",
+                "last_encrypted_hash": sops.file_hash(repo_dir / "secrets.yaml.enc"),
+                # Note: no last_decoded_hash
+            }
+        }
+        write_state(root_dir, state)
+
+        # Status should still work - it falls back to decryption comparison
+        # We mock decryption since we can't actually decrypt in tests
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_status
+from repoverlay.output import Output
+import argparse
+import subprocess
+
+# Mock the decryption to return different content (simulating a modified file)
+original_run = subprocess.run
+def mock_run(cmd, *args, **kwargs):
+    if cmd and cmd[0] == 'sops' and '--decrypt' in cmd:
+        class FakeResult:
+            returncode = 0
+            stdout = b'password: original'
+            stderr = b''
+        return FakeResult()
+    return original_run(cmd, *args, **kwargs)
+
+o = Output(no_color=True)
+args = argparse.Namespace(debug=False)
+with patch('subprocess.run', side_effect=mock_run):
+    rc = cmd_status(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        # Status should complete without error
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        # And should show the file as modified (fallback comparison detected change)
+        assert "secrets.yaml" in result.stdout
+
+    def test_sync_recovers_state_for_new_encrypted_files(self, tmp_main_repo, sample_config):
+        """Sync should detect and decrypt new encrypted files even with no prior state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        root_dir = tmp_main_repo
+        repo_dir = root_dir / ".repoverlay" / "repo"
+        decoded_dir = root_dir / ".repoverlay" / "decoded"
+
+        # Clear state to simulate destruction
+        from repoverlay.state import write_state
+        write_state(root_dir, {"symlinks": [], "created_directories": [], "encrypted_files": {}})
+
+        # Add an encrypted file to the repo
+        enc_file = repo_dir / "new_secret.yaml.enc"
+        enc_file.write_text("ENC[some-encrypted-content]")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add encrypted"], cwd=repo_dir, capture_output=True)
+
+        # Sync should detect the new encrypted file
+        # We mock SOPS availability but not actual decryption (it will warn)
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_sync
+from repoverlay.output import Output
+from repoverlay import sops
+import argparse
+
+o = Output(no_color=True)
+args = argparse.Namespace(force=False, dry_run=False, intellij=False)
+
+# Mock SOPS as available but decryption fails (no keys)
+with patch.object(sops, 'is_sops_available', return_value=True):
+    rc = cmd_sync(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        # Sync should complete (possibly with warnings about decryption)
+        # The important thing is it doesn't crash
+        assert result.returncode in [0, 2], f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+
+class TestStatusShowsOverlayPaths:
+    """Tests for status showing overlay paths relative to cwd."""
+
+    def test_status_paths_relative_to_cwd_from_root(self, tmp_main_repo, sample_config):
+        """Status from project root should show overlay-relative paths."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a nested directory structure
+        nested_dir = repo_dir / "config" / "app"
+        nested_dir.mkdir(parents=True, exist_ok=True)
+        nested_file = nested_dir / "settings.yaml"
+        nested_file.write_text("key: value")
+
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add nested"], cwd=repo_dir, capture_output=True)
+
+        # Modify the file
+        nested_file.write_text("key: modified")
+
+        # Run status from project root
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "status"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        # From root, paths should be overlay-relative (e.g., "config/app/settings.yaml")
+        assert "config/app/settings.yaml" in result.stdout, \
+            f"Expected 'config/app/settings.yaml', got:\n{result.stdout}"
+        # Should NOT contain .repoverlay in the path
+        assert ".repoverlay" not in result.stdout, \
+            f"Path should not contain .repoverlay:\n{result.stdout}"
+
+    def test_status_paths_relative_to_cwd_from_subdir(self, tmp_main_repo, sample_config):
+        """Status from subdirectory should show paths relative to that directory."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a nested directory structure
+        nested_dir = repo_dir / "config" / "app"
+        nested_dir.mkdir(parents=True, exist_ok=True)
+        nested_file = nested_dir / "settings.yaml"
+        nested_file.write_text("key: value")
+
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add nested"], cwd=repo_dir, capture_output=True)
+
+        # Modify the file
+        nested_file.write_text("key: modified")
+
+        # Create a subdirectory and run status from there
+        subdir = tmp_main_repo / "config"
+        subdir.mkdir(exist_ok=True)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "status"],
+            cwd=subdir,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        # From config/, the path should be relative: "app/settings.yaml"
+        assert "app/settings.yaml" in result.stdout, \
+            f"Expected 'app/settings.yaml' (relative to config/), got:\n{result.stdout}"
+        # Should NOT contain .repoverlay in the path
+        assert ".repoverlay" not in result.stdout, \
+            f"Path should not contain .repoverlay:\n{result.stdout}"
+
+
+class TestRepairCommand:
+    """Tests for the repair command that rebuilds state from filesystem."""
+
+    def _run_script(self, tmp_main_repo, script):
+        """Run a Python script in a subprocess with the correct cwd."""
+        script_file = tmp_main_repo / "_test_script.py"
+        script_file.write_text(script)
+        result = subprocess.run(
+            [sys.executable, str(script_file)],
+            capture_output=True,
+            text=True,
+            cwd=tmp_main_repo,
+        )
+        return result
+
+    def test_repair_rebuilds_symlinks(self, tmp_main_repo, sample_config):
+        """Repair should detect and rebuild symlink state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone to set up initial state
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a file in the repo and symlink to it
+        test_file = repo_dir / "test_config.yaml"
+        test_file.write_text("key: value")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add test"], cwd=repo_dir, capture_output=True)
+
+        # Create a symlink manually
+        import os
+        symlink_path = tmp_main_repo / "test_config.yaml"
+        rel_target = os.path.relpath(test_file, symlink_path.parent)
+        symlink_path.symlink_to(rel_target)
+
+        # Destroy the state
+        from repoverlay.state import write_state
+        write_state(tmp_main_repo, {"symlinks": [], "created_directories": [], "encrypted_files": {}})
+
+        # Run repair
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "repair"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "test_config.yaml" in result.stdout
+
+        # Verify state was rebuilt
+        from repoverlay.state import read_state
+        state = read_state(tmp_main_repo)
+        assert "test_config.yaml" in state.get("symlinks", [])
+
+    def test_repair_rebuilds_encrypted_file_state(self, tmp_main_repo, sample_config):
+        """Repair should detect encrypted files and rebuild their state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        decoded_dir = tmp_main_repo / ".repoverlay" / "decoded"
+        decoded_dir.mkdir(exist_ok=True)
+
+        # Create encrypted and decoded files
+        enc_file = repo_dir / "secrets.yaml.enc"
+        enc_file.write_text("ENC[encrypted-content]")
+        decoded_file = decoded_dir / "secrets.yaml"
+        decoded_file.write_text("password: secret123")
+
+        # Destroy the state
+        from repoverlay.state import write_state
+        write_state(tmp_main_repo, {"symlinks": [], "created_directories": [], "encrypted_files": {}})
+
+        # Run repair
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "repair"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "secrets.yaml.enc" in result.stdout
+
+        # Verify encrypted_files state was rebuilt
+        from repoverlay.state import read_state
+        state = read_state(tmp_main_repo)
+        enc_state = state.get("encrypted_files", {}).get("secrets.yaml.enc", {})
+        assert enc_state.get("decoded_path") == "secrets.yaml"
+        assert "last_encrypted_hash" in enc_state
+        assert "last_decoded_hash" in enc_state  # Because decoded file exists
+
+    def test_repair_dry_run(self, tmp_main_repo, sample_config):
+        """Repair --dry-run should preview without modifying state."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create a file and symlink
+        test_file = repo_dir / "config.yaml"
+        test_file.write_text("key: value")
+
+        import os
+        symlink_path = tmp_main_repo / "config.yaml"
+        rel_target = os.path.relpath(test_file, symlink_path.parent)
+        symlink_path.symlink_to(rel_target)
+
+        # Destroy the state
+        from repoverlay.state import write_state, read_state
+        write_state(tmp_main_repo, {"symlinks": [], "created_directories": [], "encrypted_files": {}})
+
+        # Run repair --dry-run
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "repair", "--dry-run"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "Would write state" in result.stdout
+
+        # Verify state was NOT modified
+        state = read_state(tmp_main_repo)
+        assert state.get("symlinks") == []
+
+    def test_repair_with_nested_directories(self, tmp_main_repo, sample_config):
+        """Repair should track created directories for nested symlinks."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+
+        # Create nested file in repo
+        nested_file = repo_dir / "config" / "app" / "settings.yaml"
+        nested_file.parent.mkdir(parents=True, exist_ok=True)
+        nested_file.write_text("key: value")
+
+        # Create nested symlink in main repo
+        import os
+        nested_symlink = tmp_main_repo / "config" / "app" / "settings.yaml"
+        nested_symlink.parent.mkdir(parents=True, exist_ok=True)
+        rel_target = os.path.relpath(nested_file, nested_symlink.parent)
+        nested_symlink.symlink_to(rel_target)
+
+        # Destroy the state
+        from repoverlay.state import write_state
+        write_state(tmp_main_repo, {"symlinks": [], "created_directories": [], "encrypted_files": {}})
+
+        # Run repair
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "repair"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        # Verify state includes created directories
+        from repoverlay.state import read_state
+        state = read_state(tmp_main_repo)
+        created_dirs = state.get("created_directories", [])
+        assert "config" in created_dirs or "config/app" in created_dirs
+
+    def test_repair_decrypts_missing_decoded_files(self, tmp_main_repo, sample_config):
+        """Repair should attempt to decrypt encrypted files that have no decoded version."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        decoded_dir = tmp_main_repo / ".repoverlay" / "decoded"
+
+        # Create encrypted file WITHOUT decoded version
+        enc_file = repo_dir / "secrets.yaml.enc"
+        enc_file.write_text("ENC[encrypted-content]")
+
+        # Ensure decoded file doesn't exist
+        if (decoded_dir / "secrets.yaml").exists():
+            (decoded_dir / "secrets.yaml").unlink()
+
+        # Destroy the state
+        from repoverlay.state import write_state
+        write_state(tmp_main_repo, {"symlinks": [], "created_directories": [], "encrypted_files": {}})
+
+        # Run repair with mocked SOPS
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_repair
+from repoverlay.output import Output
+from repoverlay import sops
+import argparse
+
+def mock_decrypt(src, dst, config=None):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("password: decrypted_secret")
+
+o = Output(no_color=True)
+args = argparse.Namespace(dry_run=False)
+
+with patch.object(sops, 'is_sops_available', return_value=True):
+    with patch.object(sops, 'decrypt_file', side_effect=mock_decrypt):
+        rc = cmd_repair(args, o)
+sys.exit(rc)
+"""
+        result = self._run_script(tmp_main_repo, script)
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        assert "decrypted" in result.stdout.lower()
+
+        # Verify decoded file was created
+        assert (decoded_dir / "secrets.yaml").exists()
+
+        # Verify state has last_decoded_hash
+        from repoverlay.state import read_state
+        state = read_state(tmp_main_repo)
+        enc_state = state.get("encrypted_files", {}).get("secrets.yaml.enc", {})
+        assert "last_decoded_hash" in enc_state

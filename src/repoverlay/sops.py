@@ -339,6 +339,7 @@ def decrypt_all_files(
             result[str(enc_path)] = {
                 "decoded_path": decoded_name,
                 "last_encrypted_hash": file_hash(src),
+                "last_decoded_hash": file_hash(dst),
             }
 
     except SopsError:
@@ -356,17 +357,19 @@ def detect_decoded_changes(
     repo_dir: Path,
     encrypted_state: dict[str, dict[str, str]],
     sops_config: Path | None = None,
+    debug: bool = False,
 ) -> list[str]:
     """Detect which decoded files have been modified.
 
-    Compares decoded files against what would be produced by re-decrypting
-    the encrypted source.
+    Uses stored hash of decoded file content to detect changes, falling back
+    to content comparison if hash isn't available.
 
     Args:
         decoded_dir: Path to decoded files directory
         repo_dir: Path to the overlay repository
         encrypted_state: State dict from encrypted_files
         sops_config: Optional path to .sops.yaml
+        debug: Enable debug output
 
     Returns:
         List of encrypted file paths (str) whose decoded versions changed
@@ -382,25 +385,47 @@ def detect_decoded_changes(
             changed.append(enc_path_str)
             continue
 
-        # Get current decoded content
-        current_content = decoded_file.read_bytes()
-
-        # Decrypt encrypted source to temp location and compare
         enc_src = repo_dir / enc_path_str
         if not enc_src.exists():
             continue
+
+        # If we have a stored decoded hash, use that for comparison (fast & reliable)
+        last_decoded_hash = metadata.get("last_decoded_hash")
+        if last_decoded_hash:
+            current_hash = file_hash(decoded_file)
+            if debug:
+                print(f"  [debug] {decoded_path_str}: stored_hash={last_decoded_hash}, current_hash={current_hash}")
+            if current_hash != last_decoded_hash:
+                changed.append(enc_path_str)
+            continue
+
+        # Fallback: decrypt and compare content (for backward compatibility with old state)
+        # Get current decoded content
+        current_content = decoded_file.read_bytes()
 
         # Decrypt to memory via stdout
         cmd = ["sops", "--decrypt"]
         if sops_config:
             cmd.extend(["--config", str(sops_config)])
+
+        # Detect input type from filename (e.g., config.yaml.enc -> yaml)
+        input_type = _detect_input_type(enc_src)
+        if input_type:
+            cmd.extend(["--input-type", input_type])
+            cmd.extend(["--output-type", input_type])
+
         cmd.append(str(enc_src))
 
         result = subprocess.run(cmd, capture_output=True)
-        if result.returncode == 0:
-            original_content = result.stdout
-            if current_content != original_content:
-                changed.append(enc_path_str)
+        if result.returncode != 0:
+            # Can't decrypt this file - skip it (user may not have access)
+            # Show path relative to repo root (same as git)
+            print(f"  skipped: {decoded_path_str} (cannot decrypt)")
+            continue
+
+        original_content = result.stdout
+        if current_content != original_content:
+            changed.append(enc_path_str)
 
     return changed
 
@@ -445,8 +470,9 @@ def re_encrypt_changed_files(
         encrypt_file(decoded_file, enc_dst, sops_config)
         updated.append(enc_path_str)
 
-        # Update hash in state
+        # Update hashes in state (both encrypted and decoded)
         metadata["last_encrypted_hash"] = file_hash(enc_dst)
+        metadata["last_decoded_hash"] = file_hash(decoded_file)
 
     return updated
 
@@ -486,8 +512,9 @@ def re_decrypt_if_changed(
             dst = decoded_dir / decoded_path_str
             decrypt_file(enc_src, dst, sops_config)
 
-            # Update hash
+            # Update hashes (both encrypted and decoded)
             metadata["last_encrypted_hash"] = current_hash
+            metadata["last_decoded_hash"] = file_hash(dst)
             re_decrypted.append(enc_path_str)
 
     return re_decrypted

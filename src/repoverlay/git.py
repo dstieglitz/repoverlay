@@ -176,16 +176,167 @@ def push(repo_dir: Path) -> None:
     run_git(repo_dir, ["push"], capture=True)
 
 
-def status(repo_dir: Path) -> subprocess.CompletedProcess:
-    """Show git status.
+def status(
+    repo_dir: Path,
+    root_dir: Path | None = None,
+    extra_unstaged: list[str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Show git status with encrypted files integrated.
 
     Args:
         repo_dir: Path to the repository.
+        root_dir: Project root for path transformation (if None, no transformation)
+        extra_unstaged: Additional files to show as unstaged (e.g., decrypted files)
 
     Returns:
         CompletedProcess result
     """
-    return run_git(repo_dir, ["status"], capture=False)
+    import os
+    import sys
+
+    cwd = Path.cwd()
+
+    def to_display_path(overlay_path: str) -> str:
+        """Convert overlay-relative path to display path (relative to cwd).
+
+        The overlay path is the logical path in the overlay (e.g., ansible/jenkins/...).
+        The display path is relative to the user's current working directory.
+        """
+        if root_dir is None:
+            return overlay_path
+        # The symlink would be at root_dir / overlay_path
+        symlink_location = root_dir / overlay_path
+        try:
+            return os.path.relpath(symlink_location, cwd)
+        except ValueError:
+            return overlay_path
+
+    # Capture git status output so we can modify it
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    # Parse porcelain output - paths are already repo-relative from git
+    # Format: XY PATH where X=index status, Y=worktree status, then space, then path
+    # IMPORTANT: Don't strip() as leading space is the index status for unchanged files
+    staged_files = []
+    unstaged_files = []
+    untracked_files = []
+
+    for line in result.stdout.split("\n"):
+        if not line or len(line) < 4:
+            continue
+        index_status = line[0]
+        worktree_status = line[1]
+        filename = line[3:]  # Skip XY and space, get path
+        display_path = to_display_path(filename)
+
+        if index_status == "?":
+            untracked_files.append(display_path)
+        else:
+            if index_status != " ":
+                staged_files.append((index_status, display_path))
+            if worktree_status != " ":
+                unstaged_files.append((worktree_status, display_path))
+
+    # Add extra unstaged files (decoded files from encrypted sources)
+    # extra_unstaged contains the decoded path (e.g., "ansible/jenkins/...")
+    if extra_unstaged:
+        for extra_file in extra_unstaged:
+            # extra_file is already the overlay-relative path (decoded filename without .enc)
+            display_path = to_display_path(extra_file)
+            unstaged_files.append(("M", display_path))
+
+    # Get branch info
+    branch_result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+
+    # Get tracking info
+    tracking_info = ""
+    if branch:
+        tracking_result = subprocess.run(
+            ["git", "status", "--porcelain=v2", "--branch"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        for line in tracking_result.stdout.split("\n"):
+            if line.startswith("# branch.upstream"):
+                upstream = line.split()[-1] if len(line.split()) > 1 else ""
+                tracking_info = f"Your branch is up to date with '{upstream}'."
+            elif line.startswith("# branch.ab"):
+                parts = line.split()
+                ahead = int(parts[2][1:]) if len(parts) > 2 else 0
+                behind = int(parts[3][1:]) if len(parts) > 3 else 0
+                if ahead > 0 and behind > 0:
+                    tracking_info = f"Your branch and 'origin/{branch}' have diverged."
+                elif ahead > 0:
+                    tracking_info = f"Your branch is ahead of 'origin/{branch}' by {ahead} commit(s)."
+                elif behind > 0:
+                    tracking_info = f"Your branch is behind 'origin/{branch}' by {behind} commit(s)."
+
+    # Print formatted output
+    if branch:
+        print(f"On branch {branch}")
+    if tracking_info:
+        print(tracking_info)
+    print()
+
+    if staged_files:
+        print("Changes to be committed:")
+        print('  (use "git restore --staged <file>..." to unstage)')
+        for status_char, filepath in staged_files:
+            status_word = _status_char_to_word(status_char)
+            print(f"\t\x1b[32m{status_word}:   {filepath}\x1b[m")
+        print()
+
+    if unstaged_files:
+        print("Changes not staged for commit:")
+        print('  (use "git add <file>..." to update what will be committed)')
+        print('  (use "git restore <file>..." to discard changes in working directory)')
+        print('  (use "repoverlay commit" to re-encrypt and commit decrypted files)')
+        print()
+        for status_char, filepath in unstaged_files:
+            status_word = _status_char_to_word(status_char)
+            print(f"\t\x1b[31m{status_word}:   {filepath}\x1b[m")
+        print()
+
+    if untracked_files:
+        print("Untracked files:")
+        print('  (use "git add <file>..." to include in what will be committed)')
+        for filepath in untracked_files:
+            print(f"\t\x1b[31m{filepath}\x1b[m")
+        print()
+
+    if not staged_files and not unstaged_files and not untracked_files:
+        print("nothing to commit, working tree clean")
+
+    return subprocess.CompletedProcess(
+        args=["git", "status"],
+        returncode=result.returncode,
+    )
+
+
+def _status_char_to_word(char: str) -> str:
+    """Convert git status character to word."""
+    mapping = {
+        "M": "modified",
+        "A": "new file",
+        "D": "deleted",
+        "R": "renamed",
+        "C": "copied",
+        "U": "updated",
+        "?": "untracked",
+    }
+    return mapping.get(char, "modified")
 
 
 def diff(repo_dir: Path, args: list[str] | None = None) -> subprocess.CompletedProcess:

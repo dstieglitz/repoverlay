@@ -408,6 +408,7 @@ def sync_overlay(
                         "decoded_path": decoded_name,
                         "symlink_dst": decoded_name,
                         "last_encrypted_hash": sops.file_hash(src),
+                        "last_decoded_hash": sops.file_hash(dst),
                     }
                     output.info(f"Decrypted new file: {output.path(decoded_name)}")
                 except sops.SopsDecryptionError as e:
