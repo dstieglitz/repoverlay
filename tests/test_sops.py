@@ -339,8 +339,13 @@ class TestDecryptAllFiles:
         enc_file = repo_dir / "config.yaml.enc"
         enc_file.write_text("encrypted")
 
+        def mock_decrypt_side_effect(src, dst, sops_config=None):
+            """Create the decoded file when decrypt_file is called."""
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text("decrypted content")
+
         with patch.object(sops, "is_sops_available", return_value=True):
-            with patch.object(sops, "decrypt_file") as mock_decrypt:
+            with patch.object(sops, "decrypt_file", side_effect=mock_decrypt_side_effect) as mock_decrypt:
                 result = sops.decrypt_all_files(repo_dir, decoded_dir)
 
                 assert "config.yaml.enc" in result
