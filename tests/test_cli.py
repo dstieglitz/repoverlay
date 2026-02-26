@@ -1438,6 +1438,89 @@ sys.exit(rc)
         assert ".repoverlay" not in status_result.stdout
         assert not (repo_dir / ".repoverlay").exists()
 
+    def test_add_decoded_file_without_enc_never_copies_plain_to_repo(self, tmp_path, tmp_overlay_repo):
+        """Add on a decoded file with no corresponding .enc must NOT copy plaintext into repo_dir."""
+        import json
+
+        tmp_main_repo = (tmp_path / "main-resolved").resolve()
+        tmp_main_repo.mkdir()
+        subprocess.run(["git", "init"], cwd=tmp_main_repo, check=True, capture_output=True)
+
+        config = {
+            "version": 1,
+            "overlay": {"repo": str(tmp_overlay_repo.resolve())},
+        }
+        (tmp_main_repo / ".repoverlay.yaml").write_text(yaml.dump(config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        decoded_dir = tmp_main_repo / ".repoverlay" / "decoded"
+        decoded_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create ONLY a decoded file — no .enc counterpart in repo yet
+        decoded_file = decoded_dir / "helm" / "infra" / "secrets.yaml"
+        decoded_file.parent.mkdir(parents=True, exist_ok=True)
+        decoded_file.write_text("password: secret")
+
+        # Create a symlink in the main repo pointing to the decoded file
+        symlink_path = tmp_main_repo / "helm" / "infra" / "secrets.yaml"
+        symlink_path.parent.mkdir(parents=True, exist_ok=True)
+        symlink_path.symlink_to(os.path.relpath(decoded_file, symlink_path.parent))
+
+        # Write state WITHOUT an encrypted_files entry (no .enc exists yet)
+        state_path = tmp_main_repo / ".repoverlay" / "state.json"
+        state = {"symlinks": [], "created_directories": [], "encrypted_files": {}}
+        state_path.write_text(json.dumps(state))
+
+        # Run repoverlay add on the symlink — without --encrypt flag.
+        # The resolved path lands in decoded_dir, so it must be forced to encrypt,
+        # NOT copied as plaintext into repo_dir.
+        script = f"""\
+import os, sys
+os.chdir({str(tmp_main_repo)!r})
+from unittest.mock import patch
+from repoverlay.cli import cmd_add
+from repoverlay.output import Output
+from repoverlay import sops
+import argparse
+
+def mock_encrypt(src, dst, config=None):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("ENC[AES256,data:encrypted]")
+
+def mock_hash(path):
+    return "sha256:fakehash"
+
+o = Output(no_color=True)
+with patch.object(sops, 'encrypt_file', side_effect=mock_encrypt):
+    with patch.object(sops, 'file_hash', side_effect=mock_hash):
+        with patch.object(sops, 'is_sops_available', return_value=True):
+            args = argparse.Namespace(files=[{str(symlink_path)!r}], encrypt=False)
+            rc = cmd_add(args, o)
+sys.exit(rc)
+"""
+        script_file = tmp_main_repo / "_test_script.py"
+        script_file.write_text(script)
+        result = subprocess.run(
+            [sys.executable, str(script_file)],
+            capture_output=True, text=True, cwd=tmp_main_repo,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+        # The plaintext file must NOT exist inside repo_dir
+        assert not (repo_dir / "helm" / "infra" / "secrets.yaml").exists(), (
+            "Plaintext decoded file was incorrectly copied into repo_dir"
+        )
+        # The encrypted file SHOULD exist in repo_dir
+        assert (repo_dir / "helm" / "infra" / "secrets.yaml.enc").exists(), (
+            ".enc file was not created in repo_dir"
+        )
+
 
 class TestImport:
     """Tests for import command with absolute and relative paths."""

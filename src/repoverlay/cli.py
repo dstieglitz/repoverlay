@@ -800,6 +800,7 @@ def cmd_add(args, output: Output) -> int:
     files_in_repo = []
     files_to_reencrypt = []  # List of (enc_name, decoded_path) tuples
     files_external = []
+    decoded_dir_files: set[str] = set()  # External files that resolved from decoded_dir (must encrypt)
     decoded_dir = get_decoded_dir(root_dir)
 
     # Expand any directories into their constituent files first.
@@ -829,13 +830,18 @@ def cmd_add(args, output: Output) -> int:
         # Check if the resolved path is inside the decoded directory
         # (e.g., file is a symlink to .repoverlay/decoded/something, or user specified
         # a path like ../../.repoverlay/decoded/...)
-        # If so, we need to re-encrypt before staging
+        # If so, we need to re-encrypt before staging. Plaintext decoded files must
+        # NEVER be copied into repo_dir, so always continue after this check.
         try:
             rel_to_decoded = abs_path.relative_to(decoded_dir)
             enc_name = str(rel_to_decoded) + ".enc"
             if (repo_dir / enc_name).exists():
                 files_to_reencrypt.append((enc_name, abs_path))
-                continue
+            else:
+                # No .enc yet — file came from decoded dir, must be encrypted
+                files_external.append(file_path)
+                decoded_dir_files.add(file_path)
+            continue
         except ValueError:
             pass
 
@@ -924,7 +930,9 @@ def cmd_add(args, output: Output) -> int:
     files_to_add_plain = []
 
     for file_path in files_external:
-        should_encrypt = args.encrypt
+        # Files that came from the decoded directory must always be encrypted —
+        # plaintext decoded content must never be copied into repo_dir.
+        should_encrypt = args.encrypt or (file_path in decoded_dir_files)
 
         # Check against encrypt_patterns if not already flagged
         if not should_encrypt and encrypt_patterns:
@@ -1008,10 +1016,11 @@ def cmd_add(args, output: Output) -> int:
                 sops.encrypt_file(src_path, enc_dst, sops_config)
                 output.info(f"Encrypted: {output.path(enc_filename)}")
 
-                # Copy plaintext to decoded dir
+                # Copy plaintext to decoded dir (skip if src is already the decoded file)
                 decoded_dst.parent.mkdir(parents=True, exist_ok=True)
                 import shutil
-                shutil.copy2(src_path, decoded_dst)
+                if src_path.resolve() != decoded_dst.resolve():
+                    shutil.copy2(src_path, decoded_dst)
 
                 # Update state
                 encrypted_files[enc_filename] = {
@@ -1034,9 +1043,21 @@ def cmd_add(args, output: Output) -> int:
                 output.error(str(e))
                 return 1
 
-        # Update state
+        # Update state — also add new symlink destinations to the symlinks list
+        # so the main repo's git exclude is kept in sync and doesn't show decoded
+        # files as untracked in the base repo's git status.
         state["encrypted_files"] = encrypted_files
+        existing_symlinks = set(state.get("symlinks", []))
+        for enc_name in encrypted_paths:
+            symlink_dst = encrypted_files[enc_name].get("symlink_dst")
+            if symlink_dst:
+                existing_symlinks.add(symlink_dst)
+        state["symlinks"] = sorted(existing_symlinks)
         write_state(root_dir, state)
+        try:
+            update_exclude_file(root_dir, state["symlinks"])
+        except Exception:
+            pass
 
     # Handle plain files
     if files_to_add_plain:
