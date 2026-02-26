@@ -53,6 +53,50 @@ class TestCLI:
         assert result.returncode == 1
         assert "No .repoverlay.yaml found" in result.stderr
 
+    def test_clone_with_url_creates_config(self, tmp_main_repo, tmp_overlay_repo):
+        """clone with a URL creates .repoverlay.yaml when none exists."""
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone", str(tmp_overlay_repo)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        assert config_path.exists()
+        config = yaml.safe_load(config_path.read_text())
+        assert config["version"] == 1
+        assert config["overlay"]["repo"] == str(tmp_overlay_repo)
+
+    def test_clone_with_url_does_not_overwrite_existing_config(self, tmp_main_repo, sample_config, tmp_overlay_repo):
+        """clone with a URL does not overwrite an existing .repoverlay.yaml."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone", "https://example.com/other-repo"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # Config should still contain the original repo URL, not the one passed on CLI
+        config = yaml.safe_load(config_path.read_text())
+        assert config["overlay"]["repo"] == str(tmp_overlay_repo)
+
+    def test_clone_with_url_dry_run_does_not_create_config(self, tmp_main_repo, tmp_overlay_repo):
+        """clone --dry-run with URL does not create .repoverlay.yaml."""
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone", "--dry-run", str(tmp_overlay_repo)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1  # dry-run: config not created, so _get_config_and_root fails
+        assert not (tmp_main_repo / ".repoverlay.yaml").exists()
+
     def test_clone_from_subdirectory(self, tmp_main_repo, sample_config):
         """Clone works from subdirectory."""
         # Write config file

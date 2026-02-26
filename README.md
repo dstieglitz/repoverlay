@@ -76,6 +76,16 @@ pip install -e .
 
 ## Quick Start
 
+**Option A — pass the URL directly (no config file needed):**
+
+```bash
+repoverlay clone git@github.com:yourorg/config-prod.git
+```
+
+repoverlay creates `.repoverlay.yaml` automatically and symlinks all files from the overlay at their original paths. Edit the config afterward to add mappings or other options.
+
+**Option B — create `.repoverlay.yaml` first, then clone:**
+
 1. Create a `.repoverlay.yaml` in your infrastructure project:
 
 ```yaml
@@ -116,6 +126,87 @@ infra-project/
     └── values.yaml -> ../.repoverlay/repo/helm/values.yaml
 ```
 
+## Encryption Patterns
+
+`encrypt_patterns` is an optional list of glob patterns in `.repoverlay.yaml` that controls which files are automatically encrypted with SOPS when added to the overlay. Without this, you must pass `--encrypt` explicitly on every `repoverlay add` or `repoverlay import` call.
+
+### Configuration
+
+```yaml
+version: 1
+overlay:
+  repo: git@github.com:yourorg/config-prod.git
+  sops_config: .config/.sops.yaml   # optional, see SOPS Integration below
+  encrypt_patterns:
+    - "secrets/**"
+    - "**/*.secret.yaml"
+    - "**/*.env"
+    - "credentials.json"
+```
+
+### Pattern Syntax
+
+| Pattern | Matches |
+|---------|---------|
+| `secrets/**` | All files anywhere under `secrets/` |
+| `**/*.secret.yaml` | Any `.secret.yaml` file at any depth |
+| `**/*.env` | Any `.env` file at any depth |
+| `credentials.json` | Exactly `credentials.json` at the repo root |
+| `config/db.*` | Any file named `db.*` directly inside `config/` |
+
+- `*` matches any characters except `/`
+- `**` matches across directory boundaries (any depth)
+- `?` matches a single character
+- Patterns are matched against the file's path relative to the overlay repo root
+
+### Behavior
+
+When `encrypt_patterns` is configured, any file whose path matches is encrypted automatically — no `--encrypt` flag needed:
+
+```bash
+# Without encrypt_patterns: must opt in
+repoverlay add --encrypt secrets/database.yaml
+
+# With encrypt_patterns: ["secrets/**"] — auto-encrypted
+repoverlay add secrets/database.yaml
+
+# Files that don't match are added as plaintext
+repoverlay add terraform/terraform.tfvars
+```
+
+The same patterns apply to `repoverlay import`:
+
+```bash
+# Auto-encrypted because path matches "secrets/**"
+repoverlay import secrets/database.yaml
+
+# Plaintext because path doesn't match any pattern
+repoverlay import ansible/inventory
+```
+
+### Example: Separating Secrets from Config
+
+A common setup encrypts only sensitive files while keeping other config in plaintext:
+
+```yaml
+version: 1
+overlay:
+  repo: git@github.com:yourorg/config-prod.git
+  encrypt_patterns:
+    - "secrets/**"
+    - "**/*.key"
+    - "**/*.pem"
+    - "vault-password"
+```
+
+With this config:
+- `secrets/db-password.yaml` → encrypted as `secrets/db-password.yaml.enc`
+- `ansible/inventory` → added as plaintext
+- `tls/server.key` → encrypted as `tls/server.key.enc`
+- `vault-password` → encrypted as `vault-password.enc`
+
+Encrypted files appear in the overlay repo with a `.enc` suffix. When you clone or sync, they are automatically decrypted into `.repoverlay/decoded/` and symlinked as plaintext into your project.
+
 ## Commands
 
 ### `repoverlay clone`
@@ -123,16 +214,37 @@ infra-project/
 Clone the overlay repository and create symlinks.
 
 ```bash
-repoverlay clone [--force] [--dry-run]
+repoverlay clone [URL] [--force] [--dry-run]
 ```
 
-| Flag | Description |
+| Argument/Flag | Description |
 |------|-------------|
+| `URL` | Git URL or local path of overlay repo. Creates `.repoverlay.yaml` if none exists |
 | `--force`, `-f` | Overwrite existing `.repoverlay/repo/` and destination files |
 | `--dry-run`, `-n` | Preview changes without executing |
 | `--intellij` | Configure IntelliJ IDEA to track overlay repo as VCS root |
 
 Files that already exist in your project are skipped with a warning. Use `--force` to overwrite them.
+
+#### Cloning without a config file
+
+If no `.repoverlay.yaml` exists, you can pass a URL directly and repoverlay will create one for you:
+
+```bash
+repoverlay clone git@github.com:yourorg/config-prod.git
+```
+
+This creates a minimal `.repoverlay.yaml` in the current directory:
+
+```yaml
+version: 1
+overlay:
+  repo: git@github.com:yourorg/config-prod.git
+```
+
+All files from the overlay repo are then symlinked into your project at their original paths (no explicit mappings). You can edit `.repoverlay.yaml` afterward to add mappings, `encrypt_patterns`, or other options, then run `repoverlay sync` to apply the changes.
+
+If a `.repoverlay.yaml` already exists, the URL argument is ignored and the existing config is used.
 
 ### `repoverlay sync`
 

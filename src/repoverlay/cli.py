@@ -4,6 +4,7 @@ import argparse
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 from . import __version__, git, sops
 from .config import ConfigError, find_config, load_config
@@ -56,6 +57,12 @@ def main() -> int:
 
     # clone command
     clone_parser = subparsers.add_parser("clone", help="Clone overlay repo and create symlinks")
+    clone_parser.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="URL of overlay repo (creates .repoverlay.yaml if not present)",
+    )
     clone_parser.add_argument(
         "--force", "-f",
         action="store_true",
@@ -296,6 +303,20 @@ def _get_repo_dir_or_error(output: Output):
 
 def cmd_clone(args, output: Output) -> int:
     """Execute the clone command."""
+    # If a URL is provided and no config exists, create a minimal .repoverlay.yaml
+    if args.url is not None:
+        try:
+            find_config()
+        except ConfigError:
+            if not args.dry_run:
+                config_path = Path.cwd() / ".repoverlay.yaml"
+                config_path.write_text(
+                    f"version: 1\noverlay:\n  repo: {args.url}\n"
+                )
+                output.info(f"Created .repoverlay.yaml with repo: {args.url}")
+            else:
+                output.info(f"Would create .repoverlay.yaml with repo: {args.url}")
+
     result = _get_config_and_root(output)
     if result is None:
         return 1
