@@ -413,6 +413,11 @@ def restore(repo_dir: Path, files: list[str], *, staged: bool = False) -> None:
     Raises:
         GitError: If restore fails.
     """
+    if staged and not has_commits(repo_dir):
+        # No HEAD yet — use git rm --cached to unstage
+        run_git(repo_dir, ["rm", "-r", "--cached"] + files, capture=True)
+        return
+
     cmd = ["restore"]
     if staged:
         cmd.append("--staged")
@@ -420,8 +425,26 @@ def restore(repo_dir: Path, files: list[str], *, staged: bool = False) -> None:
     run_git(repo_dir, cmd, capture=True)
 
 
+def has_commits(repo_dir: Path) -> bool:
+    """Check if a repository has any commits.
+
+    Args:
+        repo_dir: Path to the repository.
+
+    Returns:
+        True if the repository has at least one commit.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
 def reset(repo_dir: Path, files: list[str] | None = None) -> None:
-    """Unstage files (git reset HEAD).
+    """Unstage files (git reset HEAD, or git rm --cached on empty repos).
 
     Args:
         repo_dir: Path to the repository.
@@ -430,6 +453,14 @@ def reset(repo_dir: Path, files: list[str] | None = None) -> None:
     Raises:
         GitError: If reset fails.
     """
+    if not has_commits(repo_dir):
+        # No HEAD yet — use git rm --cached to unstage
+        if files:
+            run_git(repo_dir, ["rm", "--cached"] + files, capture=True)
+        else:
+            run_git(repo_dir, ["rm", "-r", "--cached", "."], capture=True)
+        return
+
     cmd = ["reset", "HEAD"]
     if files:
         cmd.extend(files)

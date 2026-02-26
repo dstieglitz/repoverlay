@@ -772,6 +772,48 @@ class TestAddCommand:
         )
         assert "myconfig/settings.yaml" in status_result.stdout
 
+    def test_add_directory_from_outside_repo(self, tmp_main_repo, sample_config):
+        """Add command recursively copies a directory into the overlay repo."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a directory with multiple files outside the overlay repo
+        external_dir = tmp_main_repo / "helm" / "cluster" / "environments"
+        external_dir.mkdir(parents=True)
+        (external_dir / "prod.yaml").write_text("env: prod")
+        (external_dir / "staging.yaml").write_text("env: staging")
+        (external_dir / "nested" / "values.yaml").parent.mkdir()
+        (external_dir / "nested" / "values.yaml").write_text("nested: true")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(external_dir)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        assert (repo_dir / "helm" / "cluster" / "environments" / "prod.yaml").exists()
+        assert (repo_dir / "helm" / "cluster" / "environments" / "staging.yaml").exists()
+        assert (repo_dir / "helm" / "cluster" / "environments" / "nested" / "values.yaml").exists()
+
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "helm/cluster/environments/prod.yaml" in status_result.stdout
+        assert "helm/cluster/environments/staging.yaml" in status_result.stdout
+        assert "helm/cluster/environments/nested/values.yaml" in status_result.stdout
+
     def test_add_file_already_in_repo(self, tmp_main_repo, sample_config):
         """Add command stages files that are already in the overlay repo."""
         config_path = tmp_main_repo / ".repoverlay.yaml"

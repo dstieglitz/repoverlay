@@ -802,7 +802,25 @@ def cmd_add(args, output: Output) -> int:
     files_external = []
     decoded_dir = get_decoded_dir(root_dir)
 
+    # Expand any directories into their constituent files first.
+    # source_dir_map tracks which directory each expanded file came from so that
+    # encrypt_patterns can be matched relative to the source directory, not just root_dir.
+    expanded_files = []
+    source_dir_map: dict[str, Path | None] = {}
     for file_path in args.files:
+        path = Path(file_path)
+        abs_path = path.resolve() if path.is_absolute() else (Path.cwd() / file_path).resolve()
+        if abs_path.is_dir():
+            for child in abs_path.rglob("*"):
+                if child.is_file():
+                    child_str = str(child)
+                    expanded_files.append(child_str)
+                    source_dir_map[child_str] = abs_path
+        else:
+            expanded_files.append(file_path)
+            source_dir_map[file_path] = None
+
+    for file_path in expanded_files:
         path = Path(file_path)
 
         # Resolve to absolute path to handle all path types uniformly
@@ -910,18 +928,25 @@ def cmd_add(args, output: Output) -> int:
 
         # Check against encrypt_patterns if not already flagged
         if not should_encrypt and encrypt_patterns:
-            # Get relative path for pattern matching
             abs_path = Path(file_path).resolve()
-            try:
-                rel_path = abs_path.relative_to(repo_dir)
-            except ValueError:
-                # File is outside repo_dir, try relative to root_dir
+            # Build candidate paths for pattern matching, most specific first:
+            # 1. Relative to the source directory (when file came from a directory arg)
+            # 2. Relative to root_dir
+            # 3. Basename fallback
+            candidates = []
+            source_dir = source_dir_map.get(file_path)
+            if source_dir is not None:
                 try:
-                    rel_path = abs_path.relative_to(root_dir)
+                    candidates.append(abs_path.relative_to(source_dir))
                 except ValueError:
-                    # File is outside project, use basename
-                    rel_path = Path(abs_path.name)
-            if matches_any_pattern(str(rel_path), encrypt_patterns):
+                    pass
+            try:
+                candidates.append(abs_path.relative_to(root_dir))
+            except ValueError:
+                pass
+            if not candidates:
+                candidates.append(Path(abs_path.name))
+            if any(matches_any_pattern(str(p), encrypt_patterns) for p in candidates):
                 should_encrypt = True
 
         if should_encrypt:

@@ -130,6 +130,10 @@ infra-project/
 
 `encrypt_patterns` is an optional list of glob patterns in `.repoverlay.yaml` that controls which files are automatically encrypted with SOPS when added to the overlay. Without this, you must pass `--encrypt` explicitly on every `repoverlay add` or `repoverlay import` call.
 
+## SOPS Configuration
+
+See https://github.com/getsops/sops?tab=readme-ov-file#2usage
+
 ### Configuration
 
 ```yaml
