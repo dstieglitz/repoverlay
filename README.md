@@ -271,12 +271,13 @@ Files that already exist in your project are skipped with a warning. Use `--forc
 Remove all symlinks and clean up.
 
 ```bash
-repoverlay unlink [--remove-repo] [--dry-run]
+repoverlay unlink [--remove-repo] [--force] [--dry-run]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--remove-repo` | Also remove `.repoverlay/` directory |
+| `--force`, `-f` | Proceed even with uncommitted overlay changes |
 | `--dry-run`, `-n` | Preview changes without executing |
 
 ### `repoverlay cloak`
@@ -391,6 +392,62 @@ Files matching `encrypt_patterns` in `.repoverlay.yaml` are automatically encryp
 
 Untracked files (not in the main repo's git index) are imported normally — the `git rm` step is simply skipped for them.
 
+### `repoverlay migrate`
+
+Move a file between the main repo and the overlay repo. Direction is detected automatically based on where the file lives.
+
+```bash
+repoverlay migrate <file> [--to DEST] [--encrypt] [--purge-history] [--dry-run]
+```
+
+| Argument/Flag | Description |
+|------|-------------|
+| `file` | File to migrate (path relative to cwd or absolute) |
+| `--to DEST` | Override destination path; defaults to the same relative path in the target repo |
+| `--encrypt`, `-e` | Encrypt when moving into the overlay (also auto-triggered by `encrypt_patterns`) |
+| `--purge-history` | Rewrite source repo history to remove the file (requires `git-filter-repo`) |
+| `--dry-run`, `-n` | Preview changes without executing |
+
+**Moving a file from the main repo into the overlay (main → overlay):**
+
+```bash
+# Move terraform.tfvars into the overlay
+repoverlay migrate terraform/terraform.tfvars
+
+# Move and encrypt a secret
+repoverlay migrate secrets/db-password.yaml --encrypt
+
+# Move to a different path in the overlay
+repoverlay migrate local/path/config.yaml --to config/production.yaml
+
+# Remove the file from main repo git history after migrating
+repoverlay migrate terraform/terraform.tfvars --purge-history
+```
+
+What it does:
+1. Copies the file into the overlay repo (or encrypts it there)
+2. Removes the original file and creates a symlink in its place
+3. Removes the file from the main repo's git index (if tracked)
+4. Stages the file in the overlay repo
+5. Updates state and git exclude files
+
+**Moving a file from the overlay back into the main repo (overlay → main):**
+
+```bash
+# Promote an overlay file back into the main repo
+repoverlay migrate .repoverlay/repo/config/feature-flags.yaml
+```
+
+What it does:
+1. Copies (or decrypts) the file into the main repo
+2. Removes the file from the overlay repo's git index
+3. Removes any symlinks in the main repo that pointed to it
+4. Updates state
+
+**Difference from `import`:**
+
+`import` is designed for moving files *into* the overlay from the main repo. `migrate` is bidirectional—it can also move files from the overlay back into the main repo, and supports optional history rewriting.
+
 ### Git Passthrough Commands
 
 Run git commands in the overlay repository:
@@ -399,14 +456,19 @@ Run git commands in the overlay repository:
 |---------|-------------|
 | `repoverlay status` | Show overlay repo status |
 | `repoverlay fetch` | Fetch from overlay remote |
-| `repoverlay pull` | Pull updates, then sync symlinks |
+| `repoverlay pull [--rebase\|--merge\|--ff-only]` | Pull updates, then sync symlinks |
 | `repoverlay push` | Push overlay changes |
 | `repoverlay diff [args]` | Show overlay diff |
+| `repoverlay log [args]` | Show overlay commit log |
 | `repoverlay add [-e] <files>` | Stage files in overlay (`-e`/`--encrypt` to encrypt with SOPS) |
+| `repoverlay restore [-S] <files>` | Restore files in overlay (`-S`/`--staged` to unstage) |
+| `repoverlay reset [files]` | Unstage files from overlay (defaults to all staged) |
 | `repoverlay import [-e] <files>` | Import files from main repo into overlay (see below) |
+| `repoverlay migrate <file>` | Move a file between main repo and overlay (see below) |
 | `repoverlay commit [-a] -m "msg"` | Commit overlay changes (`-a` stages modified files) |
-| `repoverlay checkout <ref>` | Checkout ref, then sync symlinks |
+| `repoverlay checkout [-b] <ref>` | Checkout ref (or create branch with `-b`), then sync symlinks |
 | `repoverlay merge <branch>` | Merge branch, then sync symlinks |
+| `repoverlay repair` | Rebuild state from filesystem |
 | `repoverlay cloak` | Remove plaintext secrets from disk, relink to encrypted files |
 | `repoverlay decloak [file]` | Decrypt secrets and restore symlinks to plaintext files |
 

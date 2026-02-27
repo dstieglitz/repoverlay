@@ -381,8 +381,7 @@ def detect_decoded_changes(
         decoded_file = decoded_dir / decoded_path_str
 
         if not decoded_file.exists():
-            # Decoded file was deleted - consider as changed
-            changed.append(enc_path_str)
+            # Decoded file doesn't exist (cloaked or never decrypted) - not a pending change
             continue
 
         enc_src = repo_dir / enc_path_str

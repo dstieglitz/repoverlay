@@ -357,7 +357,7 @@ class TestDetectDecodedChanges:
     """Tests for detecting changes to decoded files."""
 
     def test_detect_deleted_file(self, tmp_path):
-        """Detects deleted decoded files."""
+        """Missing decoded files (cloaked/never decrypted) are not reported as changed."""
         decoded_dir = tmp_path / "decoded"
         repo_dir = tmp_path / "repo"
         decoded_dir.mkdir()
@@ -371,7 +371,7 @@ class TestDetectDecodedChanges:
         }
 
         changed = sops.detect_decoded_changes(decoded_dir, repo_dir, encrypted_state)
-        assert "config.yaml.enc" in changed
+        assert "config.yaml.enc" not in changed
 
     def test_detect_unchanged_file(self, tmp_path):
         """No changes when file matches encrypted source."""

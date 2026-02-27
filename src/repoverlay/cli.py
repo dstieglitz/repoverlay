@@ -13,6 +13,7 @@ from .ignore import matches_any_pattern
 from .output import Output, set_output
 from .intellij import configure_vcs_root, remove_vcs_root
 from .overlay import (
+    MigrateError,
     OverlayError,
     UncommittedChangesError,
     UnpushedCommitsError,
@@ -21,6 +22,7 @@ from .overlay import (
     decloak_overlay,
     get_decoded_dir,
     get_repo_dir,
+    migrate_file,
     sync_overlay,
     unlink_overlay,
 )
@@ -214,6 +216,38 @@ def main() -> int:
         help="Preview changes without executing",
     )
 
+    # migrate command
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Move a file between the main repo and the overlay repo",
+    )
+    migrate_parser.add_argument(
+        "file",
+        help="File to migrate (path relative to cwd or absolute)",
+    )
+    migrate_parser.add_argument(
+        "--to",
+        dest="destination",
+        default=None,
+        metavar="DEST",
+        help="Destination path; defaults to same relative path in destination repo",
+    )
+    migrate_parser.add_argument(
+        "--purge-history",
+        action="store_true",
+        help="Rewrite source repo history to remove the file (requires git-filter-repo)",
+    )
+    migrate_parser.add_argument(
+        "--encrypt", "-e",
+        action="store_true",
+        help="Force encryption when moving into overlay (also auto-triggered by encrypt_patterns)",
+    )
+    migrate_parser.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="Preview changes without executing",
+    )
+
     args = parser.parse_args()
 
     # Set up output handler
@@ -246,6 +280,7 @@ def main() -> int:
         "repair": lambda: cmd_repair(args, output),
         "cloak": lambda: cmd_cloak(args, output),
         "decloak": lambda: cmd_decloak(args, output),
+        "migrate": lambda: cmd_migrate(args, output),
     }
 
     handler = handlers.get(args.command)
@@ -1792,6 +1827,31 @@ def cmd_decloak(args, output: Output) -> int:
             output=output,
         )
     except OverlayError as e:
+        output.error(str(e))
+        return 1
+
+    return 0
+
+
+def cmd_migrate(args, output: Output) -> int:
+    """Move a file between the main repo and the overlay repo."""
+    result = _get_config_and_root(output)
+    if result is None:
+        return 1
+    config, root_dir = result
+
+    try:
+        migrate_file(
+            root_dir,
+            config,
+            args.file,
+            args.destination,
+            purge_history=args.purge_history,
+            encrypt=args.encrypt,
+            dry_run=args.dry_run,
+            output=output,
+        )
+    except MigrateError as e:
         output.error(str(e))
         return 1
 

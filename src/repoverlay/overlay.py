@@ -2,13 +2,14 @@
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from . import git
 from . import sops
 from .exclude import update_exclude_file
-from .ignore import filter_mappings, load_ignore_patterns
+from .ignore import filter_mappings, load_ignore_patterns, matches_any_pattern
 from .output import Output, get_output
 from .state import read_state, write_state
 from .validation import ValidationError, validate_mappings
@@ -17,6 +18,11 @@ from .warnings import check_gitignore_conflicts
 
 class OverlayError(Exception):
     """Raised when overlay operations fail."""
+    pass
+
+
+class MigrateError(OverlayError):
+    """Raised when migrate operations fail."""
     pass
 
 
@@ -1048,3 +1054,347 @@ def _update_git_exclude_safe(root_dir: Path, symlinks: list[str]) -> None:
         update_exclude_file(root_dir, symlinks)
     except Exception:
         pass  # Ignore errors updating exclude file
+
+
+def _should_encrypt_at_destination(dst_rel: str, config: dict, encrypt_flag: bool) -> bool:
+    """Determine if a file should be encrypted when moved into the overlay.
+
+    Args:
+        dst_rel: Destination relative path in the overlay repo.
+        config: Validated config dict.
+        encrypt_flag: Whether --encrypt flag was passed.
+
+    Returns:
+        True if the file should be encrypted.
+    """
+    if encrypt_flag:
+        return True
+    patterns = config.get("overlay", {}).get("encrypt_patterns", [])
+    return bool(patterns and matches_any_pattern(dst_rel, patterns))
+
+
+def _purge_history(repo_dir: Path, file_path: str, output: Output) -> None:
+    """Rewrite repo history to remove a file using git-filter-repo.
+
+    Args:
+        repo_dir: Repository to rewrite.
+        file_path: Repo-relative path to purge.
+        output: Output handler.
+
+    Raises:
+        MigrateError: If git-filter-repo is missing or rewrite fails.
+    """
+    result = subprocess.run(
+        ["git", "filter-repo", "--version"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise MigrateError(
+            "git-filter-repo is not installed.\n"
+            "Install it: pip install git-filter-repo  or  brew install git-filter-repo\n"
+            "See https://github.com/newren/git-filter-repo"
+        )
+
+    result = subprocess.run(
+        ["git", "filter-repo", "--path", file_path, "--invert-paths", "--force"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise MigrateError(f"History rewrite failed: {result.stderr.strip()}")
+
+
+def migrate_file(
+    root_dir: Path,
+    config: dict,
+    file_arg: str,
+    destination: str | None,
+    *,
+    purge_history: bool,
+    encrypt: bool,
+    dry_run: bool,
+    output: Output,
+) -> None:
+    """Move a file between the main repo and the overlay repo.
+
+    Direction is detected automatically:
+    - File inside root_dir (but not overlay) → main → overlay
+    - File inside .repoverlay/repo/ → overlay → main
+
+    Args:
+        root_dir: Root directory of the main repo.
+        config: Validated config dict.
+        file_arg: Path to the file to migrate (relative to cwd or absolute).
+        destination: Override destination path; defaults to same relative path.
+        purge_history: If True, rewrite source repo history to remove the file.
+        encrypt: If True, force encryption when moving into the overlay.
+        dry_run: Preview only, no filesystem changes.
+        output: Output handler.
+
+    Raises:
+        MigrateError: On any error condition.
+    """
+    # Phase 1 — Resolve source and detect direction
+    abs_file = Path(file_arg)
+    if not abs_file.is_absolute():
+        abs_file = (Path.cwd() / abs_file).resolve()
+
+    if not abs_file.exists() and not abs_file.is_symlink():
+        raise MigrateError(f"File not found: {file_arg}")
+
+    repo_dir = get_repo_dir(root_dir)
+    decoded_dir = get_decoded_dir(root_dir)
+
+    # Error if already a symlink into overlay
+    if abs_file.is_symlink():
+        link_target = Path(os.readlink(abs_file))
+        if not link_target.is_absolute():
+            link_target = (abs_file.parent / link_target).resolve()
+        for overlay_base in (repo_dir, decoded_dir):
+            try:
+                link_target.relative_to(overlay_base)
+                raise MigrateError(
+                    f"File is already a symlink into the overlay: {file_arg}"
+                )
+            except ValueError:
+                pass
+
+    # Detect direction
+    is_main_to_overlay = False
+    is_overlay_to_main = False
+
+    try:
+        abs_file.relative_to(repo_dir)
+        is_overlay_to_main = True
+    except ValueError:
+        pass
+
+    if not is_overlay_to_main:
+        try:
+            abs_file.relative_to(root_dir)
+            is_main_to_overlay = True
+        except ValueError:
+            pass
+
+    if not is_main_to_overlay and not is_overlay_to_main:
+        raise MigrateError(f"File is outside the project: {file_arg}")
+
+    state = read_state(root_dir)
+    sops_config = sops.get_sops_config_path(repo_dir, config)
+
+    # Phase 2 — Determine destination path
+    if is_main_to_overlay:
+        rel_in_source = abs_file.relative_to(root_dir)
+        dst_rel = Path(destination) if destination else rel_in_source
+        should_encrypt = _should_encrypt_at_destination(str(dst_rel), config, encrypt)
+
+        if should_encrypt:
+            enc_dst_abs = repo_dir / (str(dst_rel) + ".enc")
+            if enc_dst_abs.exists():
+                raise MigrateError(
+                    f"Encrypted destination already exists in overlay: {dst_rel}.enc"
+                )
+        else:
+            dst_abs = repo_dir / dst_rel
+            if dst_abs.exists():
+                raise MigrateError(f"Destination already exists in overlay: {dst_rel}")
+
+    else:  # overlay → main
+        rel_in_source = abs_file.relative_to(repo_dir)
+        dst_rel = Path(destination) if destination else rel_in_source
+        # Strip encryption suffix from destination if present
+        dst_rel_str = str(dst_rel)
+        if sops.is_encrypted_file(dst_rel_str):
+            dst_rel = Path(sops.get_decoded_path(dst_rel_str))
+        dst_abs = root_dir / dst_rel
+
+        if dst_abs.exists() or dst_abs.is_symlink():
+            if dst_abs.is_symlink():
+                existing_target = Path(os.readlink(dst_abs))
+                if not existing_target.is_absolute():
+                    existing_target = (dst_abs.parent / existing_target).resolve()
+                if existing_target != abs_file.resolve():
+                    raise MigrateError(f"Destination already exists: {dst_rel}")
+            else:
+                raise MigrateError(f"Destination already exists: {dst_rel}")
+
+    # Phase 3 — Dry run
+    if dry_run:
+        if is_main_to_overlay:
+            output.info(
+                f"{output.dry_run_prefix()} Would move {output.path(str(rel_in_source))}"
+                f" → overlay:{output.path(str(dst_rel))}"
+            )
+            if should_encrypt:
+                output.info(
+                    f"{output.dry_run_prefix()} Would encrypt → {str(dst_rel)}.enc"
+                )
+            output.info(
+                f"{output.dry_run_prefix()} Would create symlink at"
+                f" {output.path(str(rel_in_source))}"
+            )
+            output.info(
+                f"{output.dry_run_prefix()} Would remove {output.path(str(rel_in_source))}"
+                f" from main repo index (if tracked)"
+            )
+        else:
+            output.info(
+                f"{output.dry_run_prefix()} Would move overlay:{output.path(str(rel_in_source))}"
+                f" → {output.path(str(dst_rel))}"
+            )
+            output.info(
+                f"{output.dry_run_prefix()} Would remove symlink in main repo"
+            )
+            output.info(
+                f"{output.dry_run_prefix()} Would remove {output.path(str(rel_in_source))}"
+                f" from overlay index"
+            )
+        if purge_history:
+            src_label = "main repo" if is_main_to_overlay else "overlay repo"
+            output.info(
+                f"{output.dry_run_prefix()} Would purge {str(rel_in_source)}"
+                f" from {src_label} history"
+            )
+        return
+
+    # Phase 4a — Execute: main → overlay
+    if is_main_to_overlay:
+        rel_in_source_str = str(rel_in_source)
+
+        if should_encrypt:
+            if not sops.is_sops_available():
+                raise MigrateError(
+                    "SOPS is not installed but encryption is required.\n"
+                    "Install SOPS: brew install sops  or  apt install sops"
+                )
+            enc_dst_abs = repo_dir / (str(dst_rel) + ".enc")
+            enc_dst_abs.parent.mkdir(parents=True, exist_ok=True)
+            sops.encrypt_file(abs_file, enc_dst_abs, sops_config)
+            # Also copy plaintext into decoded dir
+            decoded_copy = decoded_dir / dst_rel
+            decoded_copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(abs_file, decoded_copy)
+            staged_path = str(dst_rel) + ".enc"
+        else:
+            dst_abs = repo_dir / dst_rel
+            dst_abs.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(abs_file, dst_abs)
+            staged_path = str(dst_rel)
+
+        git.add(repo_dir, [staged_path])
+
+        abs_file.unlink()
+
+        # Create symlink at original location
+        if should_encrypt:
+            link_target = decoded_dir / dst_rel
+        else:
+            link_target = repo_dir / dst_rel
+        abs_file.parent.mkdir(parents=True, exist_ok=True)
+        rel_symlink = os.path.relpath(link_target, abs_file.parent)
+        abs_file.symlink_to(rel_symlink)
+
+        # Remove from main repo index if tracked
+        tracked = git.get_tracked_files(root_dir, [rel_in_source_str])
+        if tracked:
+            git.rm(root_dir, tracked, cached=True)
+
+        # Update state
+        symlinks = state.get("symlinks", [])
+        symlinks.append(rel_in_source_str)
+        state["symlinks"] = symlinks
+        if should_encrypt:
+            state["encrypted_files"][staged_path] = {
+                "decoded_path": str(dst_rel),
+                "symlink_dst": rel_in_source_str,
+                "last_encrypted_hash": sops.file_hash(enc_dst_abs),
+                "last_decoded_hash": sops.file_hash(decoded_dir / dst_rel),
+            }
+        write_state(root_dir, state)
+        _update_git_exclude_safe(root_dir, state["symlinks"])
+
+        output.success(f"Migrated {rel_in_source_str} → overlay ({staged_path})")
+
+        if purge_history:
+            has_uncommitted, _ = git.has_uncommitted_changes(root_dir)
+            if has_uncommitted:
+                raise MigrateError(
+                    "Cannot purge history: main repo has uncommitted changes. "
+                    "Commit or stash them first."
+                )
+            _purge_history(root_dir, rel_in_source_str, output)
+            output.warning("History rewritten. Force push: git push --force-with-lease")
+
+    # Phase 4b — Execute: overlay → main
+    else:
+        rel_in_source_str = str(rel_in_source)
+        dst_abs.parent.mkdir(parents=True, exist_ok=True)
+
+        # Identify all symlinks in the main repo pointing to this overlay file
+        # (do this BEFORE removing any symlinks, so we can find them)
+        abs_file_resolved = abs_file.resolve()
+        symlinks_to_remove = []
+        for path_str in list(state.get("symlinks", [])):
+            link = root_dir / path_str
+            if link.is_symlink():
+                lt = Path(os.readlink(link))
+                if not lt.is_absolute():
+                    lt = (link.parent / lt).resolve()
+                if lt == abs_file_resolved:
+                    symlinks_to_remove.append(path_str)
+
+        # Remove any existing symlink at dst_abs before copying
+        if dst_abs.is_symlink():
+            dst_abs.unlink()
+
+        if sops.is_encrypted_file(abs_file):
+            if sops.is_sops_available():
+                sops.decrypt_file(abs_file, dst_abs, sops_config)
+            else:
+                shutil.copy2(abs_file, dst_abs)
+        else:
+            shutil.copy2(abs_file, dst_abs)
+
+        # Remove from overlay index (or delete directly if not tracked)
+        try:
+            git.rm(repo_dir, [rel_in_source_str])
+        except git.GitError:
+            abs_file.unlink(missing_ok=True)
+
+        # Remove symlinks and update state
+        for path_str in symlinks_to_remove:
+            link = root_dir / path_str
+            if link.is_symlink():
+                link.unlink()
+            state["symlinks"].remove(path_str)
+
+        # Remove from encrypted_files state
+        state["encrypted_files"].pop(rel_in_source_str, None)
+        state["encrypted_files"].pop(rel_in_source_str + ".enc", None)
+        if rel_in_source_str.endswith(".enc"):
+            state["encrypted_files"].pop(rel_in_source_str[:-4], None)
+
+        # Remove decoded copy if it exists
+        decoded_name = sops.get_decoded_path(rel_in_source_str)
+        decoded_copy = decoded_dir / decoded_name
+        if decoded_copy.exists():
+            decoded_copy.unlink()
+
+        write_state(root_dir, state)
+        _update_git_exclude_safe(root_dir, state["symlinks"])
+
+        output.success(f"Promoted overlay:{rel_in_source_str} → {str(dst_rel)}")
+
+        if purge_history:
+            has_uncommitted, _ = git.has_uncommitted_changes(repo_dir)
+            if has_uncommitted:
+                raise MigrateError(
+                    "Cannot purge history: overlay repo has uncommitted changes. "
+                    "Commit or stash them first."
+                )
+            _purge_history(repo_dir, rel_in_source_str, output)
+            output.warning(
+                "Overlay history rewritten. Force push overlay: git push --force-with-lease"
+            )

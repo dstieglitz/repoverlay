@@ -105,7 +105,7 @@ def run_git(repo_dir: Path, args: list[str], capture: bool = False) -> subproces
             text=True,
         )
         if result.returncode != 0:
-            raise GitError(result.stderr.strip() or f"Git command failed: {' '.join(args)}")
+            raise GitError(result.stderr.strip() or result.stdout.strip() or f"Git command failed: {' '.join(args)}")
         return result
     else:
         # Stream output to terminal
@@ -479,10 +479,10 @@ def commit(repo_dir: Path, message: str | None = None, args: list[str] | None = 
         GitError: If commit fails.
     """
     cmd = ["commit"]
-    if message:
-        cmd.extend(["-m", message])
     if args:
         cmd.extend(args)
+    if message:
+        cmd.extend(["-m", message])
     run_git(repo_dir, cmd, capture=True)
 
 
