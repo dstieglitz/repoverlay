@@ -1,6 +1,7 @@
 """Command-line interface."""
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -537,9 +538,17 @@ def cmd_status(args, output: Output) -> int:
                 f"Found {len(tracked)} overlay symlink(s) tracked by the main repo!"
             )
             output.info("These should be removed from the main repo's index:")
+            cwd = Path.cwd()
+            display_paths = []
             for path in tracked:
-                output.info(f"  {path}")
-            output.info("Run: git rm --cached " + " ".join(tracked))
+                abs_path = root_dir / path
+                try:
+                    rel = os.path.relpath(abs_path, cwd)
+                except ValueError:
+                    rel = str(abs_path)
+                display_paths.append(rel)
+                output.info(f"  {rel}")
+            output.info("Run: git rm --cached " + " ".join(display_paths))
             output.info("")
 
     # Check for changes to decoded (encrypted) files
