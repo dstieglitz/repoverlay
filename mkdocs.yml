@@ -1,0 +1,82 @@
+site_name: repoverlay
+site_description: Clone overlay repositories and create symlinks for secrets/config management
+site_url: https://repoverlay.readthedocs.io
+repo_url: https://github.com/user/repoverlay
+repo_name: repoverlay
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Configuration:
+    - repoverlay.yaml: configuration/repoverlay-yaml.md
+    - repoverlayignore: configuration/repoverlayignore.md
+  - Commands:
+    - clone: commands/clone.md
+    - sync: commands/sync.md
+    - unlink: commands/unlink.md
+    - import: commands/import.md
+    - migrate: commands/migrate.md
+    - cloak / decloak: commands/cloak-decloak.md
+    - Git Passthrough: commands/git-passthrough.md
+  - SOPS Integration:
+    - Overview: sops/overview.md
+    - Setup: sops/setup.md
+    - Encrypt Patterns: sops/encrypt-patterns.md
+    - Workflow: sops/workflow.md
+    - Troubleshooting: sops/troubleshooting.md
+  - Integrations:
+    - IntelliJ IDEA: integrations/intellij.md
+    - Git: integrations/git.md
+  - Reference:
+    - Conflict Handling: reference/conflict-handling.md
+    - Path Validation: reference/path-validation.md
+    - Exit Codes: reference/exit-codes.md
+  - Examples:
+    - Multi-Tool Infrastructure: examples/multi-tool.md
+    - Local Directory Overlay: examples/local-overlay.md

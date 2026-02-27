@@ -46,3 +46,6 @@ htmlcov/
 # Test artifacts
 tmp/
 /.claude/
+
+# MkDocs build output
+site/
