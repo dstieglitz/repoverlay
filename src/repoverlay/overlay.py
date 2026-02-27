@@ -817,6 +817,226 @@ def unlink_overlay(
     output.success("Unlink complete.")
 
 
+def cloak_overlay(
+    root_dir: Path,
+    *,
+    dry_run: bool = False,
+    output: Output | None = None,
+) -> None:
+    """Cloak secrets: remove decrypted files and relink symlinks to encrypted files.
+
+    For each tracked encrypted file:
+    - Removes the decrypted file from .repoverlay/decoded/
+    - Replaces the symlink (which currently points to the decoded file) with one
+      that points directly to the encrypted file in .repoverlay/repo/ (WITHOUT the
+      .enc suffix in the link name, so existing code paths still work).
+
+    Args:
+        root_dir: Root directory of main repo.
+        dry_run: Preview changes without making them.
+        output: Output handler.
+
+    Raises:
+        OverlayError: If operation fails.
+    """
+    if output is None:
+        output = get_output()
+
+    repo_dir = get_repo_dir(root_dir)
+    decoded_dir = get_decoded_dir(root_dir)
+
+    if not repo_dir.exists():
+        raise OverlayError("Overlay repo not cloned. Run 'repoverlay clone' first")
+
+    state = read_state(root_dir)
+    encrypted_files = state.get("encrypted_files", {})
+
+    if not encrypted_files:
+        output.info("No encrypted files tracked - nothing to cloak.")
+        return
+
+    cloaked_count = 0
+    already_cloaked = 0
+
+    for enc_path_str, metadata in encrypted_files.items():
+        decoded_path = metadata.get("decoded_path")
+        symlink_dst = metadata.get("symlink_dst", decoded_path)
+
+        if not decoded_path or not symlink_dst:
+            continue
+
+        if metadata.get("cloaked"):
+            already_cloaked += 1
+            continue
+
+        enc_src = repo_dir / enc_path_str
+        dst_path = root_dir / symlink_dst
+        decoded_file = decoded_dir / decoded_path
+
+        if not enc_src.exists():
+            output.warning(f"Encrypted file not found: {enc_path_str}")
+            continue
+
+        if dry_run:
+            output.info(
+                f"{output.dry_run_prefix()} Would cloak {output.path(symlink_dst)}"
+                f" (-> {enc_path_str})"
+            )
+            continue
+
+        # Remove existing symlink (currently points to decoded file)
+        if dst_path.is_symlink():
+            dst_path.unlink()
+        elif dst_path.exists():
+            output.warning(f"Skipping {symlink_dst} - not a symlink, cannot cloak")
+            continue
+
+        # Remove decrypted file
+        if decoded_file.exists():
+            decoded_file.unlink()
+
+        # Create symlink pointing directly to the encrypted file (link name has no .enc suffix)
+        rel_symlink = os.path.relpath(enc_src, dst_path.parent)
+        dst_path.symlink_to(rel_symlink)
+
+        metadata["cloaked"] = True
+        output.info(f"  ~ {output.path(symlink_dst)} -> {enc_path_str} (cloaked)")
+        cloaked_count += 1
+
+    if not dry_run:
+        write_state(root_dir, state)
+        if cloaked_count > 0:
+            output.success(f"Cloaked {cloaked_count} file(s).")
+        elif already_cloaked > 0:
+            output.info("All files already cloaked.")
+        else:
+            output.info("Nothing to cloak.")
+
+
+def decloak_overlay(
+    root_dir: Path,
+    config: dict[str, Any],
+    *,
+    file: str | None = None,
+    dry_run: bool = False,
+    output: Output | None = None,
+) -> None:
+    """Decloak secrets: decrypt files and restore symlinks to decrypted versions.
+
+    Reverses cloak: for each tracked encrypted file (or a specific one):
+    - Decrypts the encrypted file to .repoverlay/decoded/
+    - Replaces the symlink (currently pointing to the .enc file) with one that
+      points to the decrypted file in .repoverlay/decoded/.
+
+    Args:
+        root_dir: Root directory of main repo.
+        config: Validated config dict.
+        file: Optional file to decloak (decoded path, e.g. "secrets/config.yaml",
+              or encrypted path, e.g. "secrets/config.yaml.enc").
+        dry_run: Preview changes without making them.
+        output: Output handler.
+
+    Raises:
+        OverlayError: If operation fails (SOPS unavailable, decryption error, etc.)
+    """
+    if output is None:
+        output = get_output()
+
+    repo_dir = get_repo_dir(root_dir)
+    decoded_dir = get_decoded_dir(root_dir)
+
+    if not repo_dir.exists():
+        raise OverlayError("Overlay repo not cloned. Run 'repoverlay clone' first")
+
+    state = read_state(root_dir)
+    encrypted_files = state.get("encrypted_files", {})
+
+    if not encrypted_files:
+        output.info("No encrypted files tracked - nothing to decloak.")
+        return
+
+    sops_config = sops.get_sops_config_path(repo_dir, config)
+
+    # Filter to a specific file if requested
+    if file:
+        targets: dict[str, dict] = {}
+        for enc_path_str, metadata in encrypted_files.items():
+            if (
+                enc_path_str == file
+                or metadata.get("decoded_path") == file
+                or metadata.get("symlink_dst") == file
+            ):
+                targets[enc_path_str] = metadata
+        if not targets:
+            raise OverlayError(f"File not found in tracked encrypted files: {file}")
+    else:
+        targets = encrypted_files
+
+    decloaked_count = 0
+    already_decloaked = 0
+
+    for enc_path_str, metadata in targets.items():
+        decoded_path = metadata.get("decoded_path")
+        symlink_dst = metadata.get("symlink_dst", decoded_path)
+
+        if not decoded_path or not symlink_dst:
+            continue
+
+        if not metadata.get("cloaked", False):
+            already_decloaked += 1
+            continue
+
+        enc_src = repo_dir / enc_path_str
+        dst_path = root_dir / symlink_dst
+        decoded_file = decoded_dir / decoded_path
+
+        if not enc_src.exists():
+            output.warning(f"Encrypted file not found: {enc_path_str}")
+            continue
+
+        if dry_run:
+            output.info(
+                f"{output.dry_run_prefix()} Would decloak {output.path(symlink_dst)}"
+                f" (-> {decoded_path})"
+            )
+            continue
+
+        # Decrypt file to decoded dir
+        try:
+            sops.decrypt_file(enc_src, decoded_file, sops_config)
+        except sops.SopsNotAvailableError as e:
+            raise OverlayError(str(e))
+        except sops.SopsDecryptionError as e:
+            raise OverlayError(str(e))
+
+        # Remove existing symlink (currently points to the encrypted file)
+        if dst_path.is_symlink():
+            dst_path.unlink()
+        elif dst_path.exists():
+            output.warning(f"Skipping {symlink_dst} - not a symlink, cannot decloak")
+            continue
+
+        # Create symlink pointing to decrypted file
+        rel_symlink = os.path.relpath(decoded_file, dst_path.parent)
+        dst_path.symlink_to(rel_symlink)
+
+        metadata["cloaked"] = False
+        metadata["last_encrypted_hash"] = sops.file_hash(enc_src)
+        metadata["last_decoded_hash"] = sops.file_hash(decoded_file)
+
+        output.info(f"  ~ {output.path(symlink_dst)} -> {decoded_path} (decloaked)")
+        decloaked_count += 1
+
+    if not dry_run:
+        write_state(root_dir, state)
+        if decloaked_count > 0:
+            output.success(f"Decloaked {decloaked_count} file(s).")
+        elif already_decloaked > 0:
+            output.info("All files already decloaked.")
+        else:
+            output.info("Nothing to decloak.")
+
+
 def _update_git_exclude_safe(root_dir: Path, symlinks: list[str]) -> None:
     """Update git exclude file, ignoring errors.
 

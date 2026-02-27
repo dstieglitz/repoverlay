@@ -279,6 +279,62 @@ repoverlay unlink [--remove-repo] [--dry-run]
 | `--remove-repo` | Also remove `.repoverlay/` directory |
 | `--dry-run`, `-n` | Preview changes without executing |
 
+### `repoverlay cloak`
+
+Remove all decrypted secret files from `.repoverlay/decoded/` and replace their symlinks with ones pointing directly to the encrypted files in `.repoverlay/repo/`. The symlink names remain unchanged (no `.enc` suffix), so existing tool paths continue to work—but the plaintext content is gone from disk.
+
+```bash
+repoverlay cloak [--dry-run]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run`, `-n` | Preview changes without executing |
+
+**Before cloaking:**
+```
+secrets.yaml -> .repoverlay/decoded/secrets.yaml   (plaintext on disk)
+```
+
+**After cloaking:**
+```
+secrets.yaml -> .repoverlay/repo/secrets.yaml.enc  (only encrypted bytes on disk)
+```
+
+This is useful when stepping away from a machine, checking in code on a shared screen, or any situation where you want to ensure plaintext secrets are not present on disk without losing access to the overlay structure.
+
+---
+
+### `repoverlay decloak`
+
+Reverse `cloak`: decrypt encrypted files back to `.repoverlay/decoded/` and restore symlinks to point to the decrypted versions. Optionally decloak a single file.
+
+```bash
+repoverlay decloak [file] [--dry-run]
+```
+
+| Argument/Flag | Description |
+|------|-------------|
+| `file` | Specific file to decloak (decoded path e.g. `secrets.yaml`, or encrypted path e.g. `secrets.yaml.enc`). Defaults to all tracked files |
+| `--dry-run`, `-n` | Preview changes without executing |
+
+**Examples:**
+```bash
+# Decloak everything
+repoverlay decloak
+
+# Decloak a single secret by its decoded name
+repoverlay decloak secrets/database.yaml
+
+# Decloak a single secret by its encrypted name
+repoverlay decloak secrets/database.yaml.enc
+
+# Preview what would happen
+repoverlay decloak --dry-run
+```
+
+---
+
 ### `repoverlay list`
 
 List files in the overlay repository. Encrypted files are marked with `(encrypted)`.
@@ -351,6 +407,8 @@ Run git commands in the overlay repository:
 | `repoverlay commit [-a] -m "msg"` | Commit overlay changes (`-a` stages modified files) |
 | `repoverlay checkout <ref>` | Checkout ref, then sync symlinks |
 | `repoverlay merge <branch>` | Merge branch, then sync symlinks |
+| `repoverlay cloak` | Remove plaintext secrets from disk, relink to encrypted files |
+| `repoverlay decloak [file]` | Decrypt secrets and restore symlinks to plaintext files |
 
 #### Push to Local Repositories
 
@@ -675,6 +733,46 @@ creation_rules:
   - path_regex: .*
     pgp: FINGERPRINT
 ```
+
+### Cloak / Decloak
+
+When working with SOPS-encrypted files, decrypted plaintext is stored in `.repoverlay/decoded/`. Sometimes you want to remove that plaintext from disk—without losing the overlay structure—and restore it later.
+
+```bash
+# Remove plaintext from disk; symlinks now point to encrypted files
+repoverlay cloak
+
+# Restore plaintext; symlinks point back to .repoverlay/decoded/
+repoverlay decloak
+
+# Decloak just one file
+repoverlay decloak secrets/database.yaml
+```
+
+**Cloaked state on disk:**
+```
+main-repo/
+├── .repoverlay/
+│   ├── repo/
+│   │   └── secrets.yaml.enc   ← encrypted content
+│   └── decoded/               ← empty (no plaintext)
+└── secrets.yaml -> .repoverlay/repo/secrets.yaml.enc
+```
+
+**Decloaked state on disk:**
+```
+main-repo/
+├── .repoverlay/
+│   ├── repo/
+│   │   └── secrets.yaml.enc
+│   └── decoded/
+│       └── secrets.yaml       ← plaintext here
+└── secrets.yaml -> .repoverlay/decoded/secrets.yaml
+```
+
+The symlink name (`secrets.yaml`) is the same in both states—tools that read the file continue to work in the decloaked state, and the encrypted bytes are accessible through the symlink in the cloaked state.
+
+Cloak/decloak state is tracked in `.repoverlay/state.json`. Both operations are idempotent—running them twice is safe.
 
 ### Troubleshooting
 

@@ -16,7 +16,9 @@ from .overlay import (
     OverlayError,
     UncommittedChangesError,
     UnpushedCommitsError,
+    cloak_overlay,
     clone_overlay,
+    decloak_overlay,
     get_decoded_dir,
     get_repo_dir,
     sync_overlay,
@@ -184,6 +186,34 @@ def main() -> int:
         help="Preview changes without executing",
     )
 
+    # cloak command
+    cloak_parser = subparsers.add_parser(
+        "cloak",
+        help="Remove decrypted secrets and relink symlinks to encrypted files",
+    )
+    cloak_parser.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="Preview changes without executing",
+    )
+
+    # decloak command
+    decloak_parser = subparsers.add_parser(
+        "decloak",
+        help="Decrypt secrets and restore symlinks to decrypted files",
+    )
+    decloak_parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="Specific file to decloak (decoded or encrypted path); defaults to all",
+    )
+    decloak_parser.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="Preview changes without executing",
+    )
+
     args = parser.parse_args()
 
     # Set up output handler
@@ -214,6 +244,8 @@ def main() -> int:
         "merge": lambda: cmd_merge(args, output),
         "list": lambda: cmd_list(output),
         "repair": lambda: cmd_repair(args, output),
+        "cloak": lambda: cmd_cloak(args, output),
+        "decloak": lambda: cmd_decloak(args, output),
     }
 
     handler = handlers.get(args.command)
@@ -1724,6 +1756,44 @@ def cmd_repair(args, output: Output) -> int:
     # 4. Write state
     write_state(root_dir, new_state)
     output.success(f"State rebuilt: {len(symlinks)} symlinks, {len(encrypted_files)} encrypted files")
+
+    return 0
+
+
+def cmd_cloak(args, output: Output) -> int:
+    """Remove decrypted secrets and relink symlinks to encrypted files."""
+    result = _get_config_and_root(output)
+    if result is None:
+        return 1
+    _config, root_dir = result
+
+    try:
+        cloak_overlay(root_dir, dry_run=args.dry_run, output=output)
+    except OverlayError as e:
+        output.error(str(e))
+        return 1
+
+    return 0
+
+
+def cmd_decloak(args, output: Output) -> int:
+    """Decrypt secrets and restore symlinks to decrypted files."""
+    result = _get_config_and_root(output)
+    if result is None:
+        return 1
+    config, root_dir = result
+
+    try:
+        decloak_overlay(
+            root_dir,
+            config,
+            file=getattr(args, "file", None),
+            dry_run=args.dry_run,
+            output=output,
+        )
+    except OverlayError as e:
+        output.error(str(e))
+        return 1
 
     return 0
 
