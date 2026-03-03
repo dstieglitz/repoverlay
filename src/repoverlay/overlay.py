@@ -861,6 +861,19 @@ def cloak_overlay(
         output.info("No encrypted files tracked - nothing to cloak.")
         return
 
+    # Check for uncommitted changes in decloaked files before cloaking
+    changed = sops.detect_decoded_changes(decoded_dir, repo_dir, encrypted_files)
+    if changed:
+        changed_names = [
+            encrypted_files[e]["decoded_path"] for e in changed if "decoded_path" in encrypted_files[e]
+        ]
+        output.error(
+            "Cannot cloak: the following decloaked file(s) have uncommitted changes:\n"
+            + "".join(f"  - {name}\n" for name in changed_names)
+            + "Run 'repoverlay commit' first to re-encrypt and commit changes."
+        )
+        raise OverlayError("Uncommitted changes in decloaked files. Commit changes before cloaking.")
+
     cloaked_count = 0
     already_cloaked = 0
 

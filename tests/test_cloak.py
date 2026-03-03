@@ -215,6 +215,35 @@ class TestCloakOverlay:
         state = read_state(env["root_dir"])
         assert not state["encrypted_files"]["secrets.yaml.enc"].get("cloaked", False)
 
+    def test_cloak_aborts_if_decoded_files_have_changes(self, env):
+        """Cloaking aborts when decoded files have been modified since last decrypt."""
+        # Modify the decoded file to simulate user edits
+        dec_file = env["decoded_dir"] / "secrets.yaml"
+        dec_file.write_text("modified plaintext content")
+
+        output, _, err = _make_output()
+        with pytest.raises(OverlayError, match="Uncommitted changes"):
+            cloak_overlay(env["root_dir"], output=output)
+
+        # Decoded file should still exist (not deleted)
+        assert dec_file.exists()
+        # Symlink should still point to decoded file (unchanged)
+        symlink_path = env["symlink_path"]
+        resolved = (symlink_path.parent / Path(os.readlink(symlink_path))).resolve()
+        assert resolved == dec_file.resolve()
+        # State should still show uncloaked
+        state = read_state(env["root_dir"])
+        assert state["encrypted_files"]["secrets.yaml.enc"]["cloaked"] is False
+        # Error message should mention the file
+        assert "secrets.yaml" in err.getvalue()
+
+    def test_cloak_succeeds_when_decoded_files_unchanged(self, env):
+        """Cloaking succeeds when decoded files have NOT been modified."""
+        output, _, _ = _make_output()
+        # env fixture writes matching hashes, so no changes detected
+        cloak_overlay(env["root_dir"], output=output)
+        assert not env["dec_file"].exists()
+
     def test_cloak_multiple_files(self, tmp_path):
         """Cloaks multiple encrypted files in one pass."""
         root_dir = tmp_path / "main"
