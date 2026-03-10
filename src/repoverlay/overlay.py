@@ -342,6 +342,30 @@ def clone_overlay(
     # Update git exclude
     _update_git_exclude_safe(root_dir, symlinks_created)
 
+    # Warn about symlinks tracked by main repo's git index
+    if symlinks_created and (root_dir / ".git").exists():
+        try:
+            tracked = git.get_tracked_files(root_dir, symlinks_created)
+            if tracked:
+                output.warning(
+                    f"{len(tracked)} overlay symlink(s) are tracked by the main repo's git index.\n"
+                    "  Git operations (checkout, merge, pull) will silently replace these symlinks\n"
+                    "  with regular files, breaking the overlay link.\n"
+                    "  To fix, run:\n"
+                    "    git rm --cached " + " ".join(tracked) + "\n"
+                    "    git commit -m 'Untrack overlay-managed files'\n"
+                    "  Consider also adding them to .gitignore to prevent future tracking."
+                )
+        except git.GitError:
+            pass  # Ignore if git check fails
+
+    # Inform about .git/info/exclude being local-only
+    if symlinks_created:
+        output.info(
+            "Note: Overlay symlinks are excluded via .git/info/exclude (local only).\n"
+            "  To protect collaborators, consider adding overlay paths to .gitignore."
+        )
+
     output.success("Overlay cloned and symlinks created successfully.")
 
 
@@ -489,6 +513,31 @@ def sync_overlay(
         dst_path = root_dir / dst
         if dst_path.is_symlink() and not dst_path.exists():
             to_remove.add(dst)
+
+    # Detect symlinks that have reverted to regular files
+    reverted_symlinks = []
+    for dst in list(new_symlinks & old_symlinks):
+        dst_path = root_dir / dst
+        if dst_path.exists() and not dst_path.is_symlink():
+            reverted_symlinks.append(dst)
+
+    if reverted_symlinks:
+        output.warning(
+            f"{len(reverted_symlinks)} symlink(s) have been replaced with regular files\n"
+            "  (likely by a git checkout, merge, stash, or an editor that replaces symlinks):"
+        )
+        for dst in sorted(reverted_symlinks):
+            output.info(f"    {dst}")
+        if force:
+            output.info("  Recreating symlinks (--force).")
+        else:
+            output.info(
+                "  Use 'repoverlay sync --force' to recreate these symlinks.\n"
+                "  WARNING: The regular file may contain edits not in the overlay repo.\n"
+                "  Back up any changes before using --force.\n"
+                "  To prevent this, run: git rm --cached <file> in the main repo."
+            )
+            exit_code = 2
 
     # Find symlinks to create
     to_create = []
@@ -821,6 +870,127 @@ def unlink_overlay(
             output.removed(".repoverlay/")
 
     output.success("Unlink complete.")
+
+
+def verify_overlay(
+    root_dir: Path,
+    *,
+    output: Output | None = None,
+) -> list[dict]:
+    """Verify all state-tracked symlinks are valid.
+
+    Checks each symlink in state for:
+    - Missing (symlink doesn't exist at all)
+    - Reverted (regular file instead of symlink)
+    - Broken (symlink exists but target doesn't)
+    - Wrong target (symlink points to unexpected location)
+    - Tracked by git (in main repo's index, will be overwritten)
+
+    Args:
+        root_dir: Root directory of main repo.
+        output: Output handler.
+
+    Returns:
+        List of issue dicts with keys: path, issue, detail
+    """
+    if output is None:
+        output = get_output()
+
+    repo_dir = get_repo_dir(root_dir)
+    decoded_dir = get_decoded_dir(root_dir)
+    state = read_state(root_dir)
+    symlinks = state.get("symlinks", [])
+    encrypted_files = state.get("encrypted_files", {})
+
+    if not symlinks:
+        output.info("No symlinks in state to verify.")
+        return []
+
+    issues = []
+
+    for dst in sorted(symlinks):
+        dst_path = root_dir / dst
+
+        if not dst_path.exists() and not dst_path.is_symlink():
+            issues.append({"path": dst, "issue": "missing", "detail": "Symlink does not exist"})
+            continue
+
+        if dst_path.exists() and not dst_path.is_symlink():
+            issues.append({
+                "path": dst,
+                "issue": "reverted",
+                "detail": "Regular file instead of symlink (likely replaced by git or editor)",
+            })
+            continue
+
+        if dst_path.is_symlink() and not dst_path.exists():
+            target = os.readlink(dst_path)
+            issues.append({
+                "path": dst,
+                "issue": "broken",
+                "detail": f"Dangling symlink -> {target}",
+            })
+            continue
+
+        # Symlink exists and target exists - check it points into .repoverlay/
+        resolved = dst_path.resolve()
+        try:
+            resolved.relative_to(repo_dir.resolve())
+            # Points into overlay repo - OK
+        except ValueError:
+            try:
+                resolved.relative_to(decoded_dir.resolve())
+                # Points into decoded dir - OK
+            except ValueError:
+                actual_target = os.readlink(dst_path)
+                issues.append({
+                    "path": dst,
+                    "issue": "wrong_target",
+                    "detail": f"Points to {actual_target}, expected target inside .repoverlay/",
+                })
+                continue
+
+    # Check for git-tracked files
+    if (root_dir / ".git").exists() and symlinks:
+        try:
+            tracked = git.get_tracked_files(root_dir, symlinks)
+            for path in tracked:
+                issues.append({
+                    "path": path,
+                    "issue": "tracked_by_git",
+                    "detail": "File is in main repo's git index; git will replace symlink on checkout/merge",
+                })
+        except git.GitError:
+            pass
+
+    # Report results
+    if issues:
+        output.warning(f"Found {len(issues)} issue(s):")
+        for issue in issues:
+            label = issue["issue"].upper().replace("_", " ")
+            output.info(f"  [{label}] {issue['path']}: {issue['detail']}")
+
+        # Provide fix suggestions
+        reverted = [i for i in issues if i["issue"] == "reverted"]
+        tracked = [i for i in issues if i["issue"] == "tracked_by_git"]
+        missing = [i for i in issues if i["issue"] == "missing"]
+        broken = [i for i in issues if i["issue"] == "broken"]
+
+        if reverted:
+            output.info(
+                "\nTo fix reverted symlinks: repoverlay sync --force\n"
+                "  WARNING: Back up any edits in the regular files first."
+            )
+        if tracked:
+            output.info(
+                "\nTo fix tracked files: git rm --cached " + " ".join(i["path"] for i in tracked)
+            )
+        if missing or broken:
+            output.info("\nTo fix missing/broken symlinks: repoverlay sync --force")
+    else:
+        output.success(f"All {len(symlinks)} symlink(s) verified OK.")
+
+    return issues
 
 
 def cloak_overlay(

@@ -26,6 +26,7 @@ from .overlay import (
     migrate_file,
     sync_overlay,
     unlink_overlay,
+    verify_overlay,
 )
 from .state import read_state, write_state
 
@@ -182,6 +183,9 @@ def main() -> int:
     subparsers.add_parser("list", help="List files in overlay repo")
 
     # repair command
+    # verify command
+    subparsers.add_parser("verify", help="Validate all symlinks are intact and pointing to correct targets")
+
     repair_parser = subparsers.add_parser("repair", help="Rebuild state from filesystem")
     repair_parser.add_argument(
         "--dry-run", "-n",
@@ -278,6 +282,7 @@ def main() -> int:
         "checkout": lambda: cmd_checkout(args, output),
         "merge": lambda: cmd_merge(args, output),
         "list": lambda: cmd_list(output),
+        "verify": lambda: cmd_verify(output),
         "repair": lambda: cmd_repair(args, output),
         "cloak": lambda: cmd_cloak(args, output),
         "decloak": lambda: cmd_decloak(args, output),
@@ -1670,6 +1675,17 @@ def cmd_merge(args, output: Output) -> int:
     except OverlayError as e:
         output.error(str(e))
         return 1
+
+
+def cmd_verify(output: Output) -> int:
+    """Validate all symlinks are intact and correct."""
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, root_dir = result
+
+    issues = verify_overlay(root_dir, output=output)
+    return 1 if issues else 0
 
 
 def cmd_repair(args, output: Output) -> int:

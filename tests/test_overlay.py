@@ -16,6 +16,7 @@ from repoverlay.overlay import (
     get_repo_dir,
     sync_overlay,
     unlink_overlay,
+    verify_overlay,
 )
 from repoverlay.state import read_state
 
@@ -841,3 +842,176 @@ class TestUnlinkOverlay:
 
         # Everything should still exist
         assert (tmp_main_repo / ".env").exists()
+
+
+class TestVerifyOverlay:
+    """Tests for verify_overlay function."""
+
+    def test_verify_all_ok(self, tmp_main_repo, sample_config):
+        """Verify returns no issues when all symlinks are correct."""
+        clone_overlay(tmp_main_repo, sample_config)
+        output = Output(quiet=True)
+        issues = verify_overlay(tmp_main_repo, output=output)
+        assert issues == []
+
+    def test_verify_detects_reverted_symlink(self, tmp_main_repo, sample_config):
+        """Verify detects when a symlink has been replaced with a regular file."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Replace symlink with a regular file (simulating git checkout)
+        env_path = tmp_main_repo / ".env"
+        assert env_path.is_symlink()
+        env_path.unlink()
+        env_path.write_text("API_KEY=overwritten")
+
+        output = Output(quiet=True)
+        issues = verify_overlay(tmp_main_repo, output=output)
+        reverted = [i for i in issues if i["issue"] == "reverted"]
+        assert len(reverted) == 1
+        assert reverted[0]["path"] == ".env"
+
+    def test_verify_detects_missing_symlink(self, tmp_main_repo, sample_config):
+        """Verify detects when a symlink is completely missing."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Remove symlink entirely
+        (tmp_main_repo / ".env").unlink()
+
+        output = Output(quiet=True)
+        issues = verify_overlay(tmp_main_repo, output=output)
+        missing = [i for i in issues if i["issue"] == "missing"]
+        assert len(missing) == 1
+        assert missing[0]["path"] == ".env"
+
+    def test_verify_detects_broken_symlink(self, tmp_main_repo, sample_config):
+        """Verify detects dangling symlinks."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Remove the target file from overlay repo
+        repo_dir = get_repo_dir(tmp_main_repo)
+        (repo_dir / ".env.production").unlink()
+
+        output = Output(quiet=True)
+        issues = verify_overlay(tmp_main_repo, output=output)
+        broken = [i for i in issues if i["issue"] == "broken"]
+        assert len(broken) == 1
+        assert broken[0]["path"] == ".env"
+
+    def test_verify_detects_wrong_target(self, tmp_main_repo, tmp_path, sample_config):
+        """Verify detects symlinks pointing to wrong targets."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Create a file outside the overlay and point the symlink to it
+        wrong_file = tmp_path / "wrong_target"
+        wrong_file.write_text("wrong")
+        env_path = tmp_main_repo / ".env"
+        env_path.unlink()
+        env_path.symlink_to(wrong_file)
+
+        output = Output(quiet=True)
+        issues = verify_overlay(tmp_main_repo, output=output)
+        wrong = [i for i in issues if i["issue"] == "wrong_target"]
+        assert len(wrong) == 1
+
+    def test_verify_detects_tracked_by_git(self, tmp_main_repo, sample_config):
+        """Verify detects symlinks tracked by the main repo's git index."""
+        # Configure git user for the main repo
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_main_repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=tmp_main_repo, check=True, capture_output=True,
+        )
+
+        # Create and commit a file that will later become an overlay symlink
+        (tmp_main_repo / ".env").write_text("OLD_KEY=old")
+        subprocess.run(["git", "add", ".env"], cwd=tmp_main_repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add env"],
+            cwd=tmp_main_repo, check=True, capture_output=True,
+        )
+
+        # Now clone overlay (force to overwrite the existing file)
+        clone_overlay(tmp_main_repo, sample_config, force=True)
+
+        output = Output(quiet=True)
+        issues = verify_overlay(tmp_main_repo, output=output)
+        tracked = [i for i in issues if i["issue"] == "tracked_by_git"]
+        assert len(tracked) >= 1
+        assert any(i["path"] == ".env" for i in tracked)
+
+    def test_verify_empty_state(self, tmp_main_repo, sample_config):
+        """Verify with no symlinks in state returns empty list."""
+        clone_overlay(tmp_main_repo, sample_config)
+        # Unlink everything
+        output = Output(quiet=True)
+        unlink_overlay(tmp_main_repo, output=output)
+        issues = verify_overlay(tmp_main_repo, output=output)
+        assert issues == []
+
+
+class TestSyncDetectsRevertedSymlinks:
+    """Tests for sync detecting reverted symlinks."""
+
+    def test_sync_warns_reverted_symlinks(self, tmp_main_repo, sample_config):
+        """Sync detects and warns about symlinks replaced by regular files."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Replace symlink with a regular file
+        env_path = tmp_main_repo / ".env"
+        env_path.unlink()
+        env_path.write_text("API_KEY=overwritten")
+
+        output = Output(quiet=True)
+        exit_code = sync_overlay(tmp_main_repo, sample_config, output=output)
+        # Should return exit code 2 (warning) without --force
+        assert exit_code == 2
+
+    def test_sync_force_recreates_reverted_symlinks(self, tmp_main_repo, sample_config):
+        """Sync --force recreates symlinks that were replaced by regular files."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Replace symlink with a regular file
+        env_path = tmp_main_repo / ".env"
+        env_path.unlink()
+        env_path.write_text("API_KEY=overwritten")
+
+        output = Output(quiet=True)
+        exit_code = sync_overlay(tmp_main_repo, sample_config, force=True, output=output)
+        assert exit_code == 0
+
+        # Should be a symlink again
+        assert env_path.is_symlink()
+
+
+class TestCloneWarnsTrackedFiles:
+    """Tests for clone warning about git-tracked files."""
+
+    def test_clone_warns_tracked_files(self, tmp_main_repo, sample_config, capsys):
+        """Clone warns when overlay destination files are tracked by main repo git."""
+        # Configure git user for the main repo
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_main_repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=tmp_main_repo, check=True, capture_output=True,
+        )
+
+        # Create and commit a file that will later become an overlay symlink
+        (tmp_main_repo / ".env").write_text("OLD_KEY=old")
+        subprocess.run(["git", "add", ".env"], cwd=tmp_main_repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add env"],
+            cwd=tmp_main_repo, check=True, capture_output=True,
+        )
+
+        # Clone overlay with force (to overwrite existing file)
+        output = Output(quiet=False, no_color=True)
+        clone_overlay(tmp_main_repo, sample_config, force=True, output=output)
+
+        captured = capsys.readouterr()
+        assert "tracked by the main repo" in captured.out or "tracked by the main repo" in captured.err
