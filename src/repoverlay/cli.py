@@ -791,6 +791,97 @@ def cmd_push(output: Output) -> int:
         return 1
 
 
+def _post_commit_symlink_sync(root_dir: Path, config: dict, output: Output) -> None:
+    """Replace regular files with symlinks after a commit.
+
+    After `repoverlay add` copies files into the overlay repo, the originals
+    remain as regular files.  After commit, this function detects those files
+    and replaces them with symlinks into the overlay repo, then updates state
+    and git exclude.
+    """
+    repo_dir = get_repo_dir(root_dir)
+    decoded_dir = get_decoded_dir(root_dir)
+    state = read_state(root_dir)
+    existing_symlinks = set(state.get("symlinks", []))
+    encrypted_files = state.get("encrypted_files", {})
+
+    # Collect encrypted file paths to exclude from plain-file handling
+    enc_file_strs = set(encrypted_files.keys())
+
+    # Build the full set of repo files so we catch files added via
+    # ``repoverlay add`` that may not appear in explicit mappings.
+    from .overlay import _generate_mappings_from_repo
+    all_enc_files = sops.scan_encrypted_files(repo_dir)
+    all_enc_strs = {str(f) for f in all_enc_files}
+    mappings = _generate_mappings_from_repo(repo_dir, encrypted_files, all_enc_strs)
+
+    new_symlinks = []
+    new_dirs = []
+
+    for mapping in mappings:
+        dst = mapping["dst"]
+        if dst in existing_symlinks:
+            continue
+
+        dst_path = root_dir / dst
+        src_path = repo_dir / mapping["src"]
+
+        # Only convert regular files (not symlinks, not missing)
+        if not dst_path.exists() or dst_path.is_symlink():
+            continue
+
+        # The file exists as a regular file and the same file is in the overlay
+        # repo — replace it with a symlink.
+        rel_symlink = os.path.relpath(src_path, dst_path.parent)
+        dst_path.unlink()
+        dst_path.symlink_to(rel_symlink)
+        new_symlinks.append(dst)
+        output.created(f"{dst} (symlink)")
+
+        # Track parent dirs
+        parent = dst_path.parent
+        if parent != root_dir:
+            rel_parent = parent.relative_to(root_dir)
+            for i in range(len(rel_parent.parts)):
+                dir_path = Path(*rel_parent.parts[:i + 1])
+                dir_str = str(dir_path)
+                if dir_str not in new_dirs:
+                    new_dirs.append(dir_str)
+
+    # Also handle encrypted files that aren't symlinked yet
+    for enc_path_str, metadata in encrypted_files.items():
+        decoded_path = metadata.get("decoded_path")
+        symlink_dst = metadata.get("symlink_dst", decoded_path)
+        if not decoded_path or not symlink_dst:
+            continue
+        if symlink_dst in existing_symlinks:
+            continue
+
+        dst_path = root_dir / symlink_dst
+        src_path = decoded_dir / decoded_path
+
+        if not dst_path.exists() or dst_path.is_symlink() or not src_path.exists():
+            continue
+
+        rel_symlink = os.path.relpath(src_path, dst_path.parent)
+        dst_path.unlink()
+        dst_path.symlink_to(rel_symlink)
+        new_symlinks.append(symlink_dst)
+        output.created(f"{symlink_dst} (symlink)")
+
+    if new_symlinks:
+        all_symlinks = sorted(set(existing_symlinks) | set(new_symlinks))
+        old_dirs = state.get("created_directories", [])
+        all_dirs = list(set(old_dirs) | set(new_dirs))
+        state["symlinks"] = all_symlinks
+        state["created_directories"] = all_dirs
+        write_state(root_dir, state)
+        try:
+            update_exclude_file(root_dir, all_symlinks)
+        except Exception:
+            pass
+
+
 def cmd_commit(args, output: Output) -> int:
     """Execute git commit in overlay repo.
 
@@ -848,10 +939,21 @@ def cmd_commit(args, output: Output) -> int:
             extra_args.extend(args.args)
         git.commit(repo_dir, message=args.message, args=extra_args if extra_args else None)
         output.success("Commit complete.")
-        return 0
     except git.GitError as e:
         output.error(str(e))
         return 1
+
+    # After a successful commit, auto-sync symlinks so that newly added files
+    # are replaced with symlinks pointing into the overlay repo.
+    cfg_result = _get_config_and_root(output)
+    if cfg_result:
+        config_for_sync, root_for_sync = cfg_result
+        try:
+            _post_commit_symlink_sync(root_for_sync, config_for_sync, output)
+        except OverlayError as e:
+            output.warning(f"Post-commit sync warning: {e}")
+
+    return 0
 
 
 def cmd_add(args, output: Output) -> int:

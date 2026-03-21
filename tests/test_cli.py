@@ -726,6 +726,51 @@ class TestCommitCommand:
         # Should not show "ahead" if tracking refs are properly updated
         assert "ahead" not in status_result.stdout
 
+    def test_commit_auto_symlinks_new_files(self, tmp_main_repo, sample_config):
+        """After add + commit, new files are automatically replaced with symlinks."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        # Clone the overlay
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a new file outside the overlay repo
+        new_file = tmp_main_repo / "myconfig" / "settings.yaml"
+        new_file.parent.mkdir(parents=True)
+        new_file.write_text("key: value")
+
+        # Add the external file
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(new_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # The file should still exist as a regular file before commit
+        assert new_file.exists()
+
+        # Commit
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "-m", "add settings"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        # After commit, the file should now be a symlink
+        assert new_file.is_symlink(), (
+            f"Expected {new_file} to be a symlink after commit, but it's a regular file"
+        )
+        # The symlink should point into the overlay repo and be readable
+        assert new_file.read_text() == "key: value"
+
 
 class TestAddCommand:
     """Tests for add command."""
