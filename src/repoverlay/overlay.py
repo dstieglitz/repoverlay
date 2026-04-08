@@ -281,7 +281,12 @@ def clone_overlay(
 
     # Load ignore patterns and filter mappings
     ignore_patterns = load_ignore_patterns(root_dir)
+    all_mappings_before_filter = mappings
     mappings = filter_mappings(mappings, ignore_patterns)
+
+    # Detect conflicts: ignored files that exist in both the overlay and main repos
+    filtered_out = set(m["dst"] for m in all_mappings_before_filter) - set(m["dst"] for m in mappings)
+    ignored_conflicts = [dst for dst in filtered_out if (root_dir / dst).exists()]
 
     # Create symlinks for regular files
     symlinks_created, dirs_created, skipped = _create_symlinks(root_dir, repo_dir, mappings, output, force=force)
@@ -333,10 +338,12 @@ def clone_overlay(
             metadata["symlink_dst"] = dst
 
     # Write state
+    all_conflicts = sorted(set(skipped) | set(ignored_conflicts))
     write_state(root_dir, {
         "symlinks": symlinks_created,
         "created_directories": dirs_created,
         "encrypted_files": encrypted_files,
+        "conflicts": all_conflicts,
     })
 
     # Update git exclude
@@ -496,7 +503,12 @@ def sync_overlay(
 
     # Load ignore patterns and filter mappings
     ignore_patterns = load_ignore_patterns(root_dir)
+    all_mappings_before_filter = mappings
     mappings = filter_mappings(mappings, ignore_patterns)
+
+    # Detect conflicts: ignored files that exist in both the overlay and main repos
+    filtered_out = set(m["dst"] for m in all_mappings_before_filter) - set(m["dst"] for m in mappings)
+    ignored_conflicts = [dst for dst in filtered_out if (root_dir / dst).exists()]
 
     # Determine new symlinks (include both regular mappings and decoded file destinations)
     new_symlinks = {m["dst"] for m in mappings}
@@ -635,10 +647,16 @@ def sync_overlay(
     old_dirs = state.get("created_directories", [])
     all_dirs = list(set(old_dirs) | set(dirs_created))
 
+    # Merge skipped (new conflicts) and ignored conflicts with any existing
+    # conflicts, removing files that are now symlinked.
+    old_conflicts = set(state.get("conflicts", []))
+    all_conflicts = sorted((old_conflicts | set(skipped) | set(ignored_conflicts)) - set(all_symlinks))
+
     write_state(root_dir, {
         "symlinks": all_symlinks,
         "created_directories": all_dirs,
         "encrypted_files": encrypted_files,
+        "conflicts": all_conflicts,
     })
 
     # Update git exclude

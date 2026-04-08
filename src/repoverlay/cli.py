@@ -556,6 +556,24 @@ def cmd_status(args, output: Output) -> int:
             output.info("Run: git rm --cached " + " ".join(display_paths))
             output.info("")
 
+    # Report conflict files (exist in both main and overlay repos)
+    conflicts = state.get("conflicts", [])
+    if conflicts:
+        output.warning(
+            f"Found {len(conflicts)} conflict(s) — file exists in both main and overlay repos:"
+        )
+        cwd = Path.cwd()
+        for path in conflicts:
+            abs_path = root_dir / path
+            try:
+                rel = os.path.relpath(abs_path, cwd)
+            except ValueError:
+                rel = str(abs_path)
+            output.info(f"  {rel}")
+        output.info("The main repo version is currently used (overlay version ignored).")
+        output.info("To use the overlay version instead, run: git rm --cached <file> && repoverlay sync")
+        output.info("")
+
     # Check for changes to decoded (encrypted) files
     encrypted_files = state.get("encrypted_files", {})
     if debug:
@@ -811,23 +829,39 @@ def _post_commit_symlink_sync(root_dir: Path, config: dict, output: Output) -> N
     # Build the full set of repo files so we catch files added via
     # ``repoverlay add`` that may not appear in explicit mappings.
     from .overlay import _generate_mappings_from_repo
+    from .ignore import load_ignore_patterns, filter_mappings
     all_enc_files = sops.scan_encrypted_files(repo_dir)
     all_enc_strs = {str(f) for f in all_enc_files}
     mappings = _generate_mappings_from_repo(repo_dir, encrypted_files, all_enc_strs)
+    ignore_patterns = load_ignore_patterns(root_dir)
+    mappings = filter_mappings(mappings, ignore_patterns)
 
     new_symlinks = []
     new_dirs = []
+    new_conflicts = []
 
+    # Collect candidates: regular files that match overlay mappings
+    candidates = []
     for mapping in mappings:
         dst = mapping["dst"]
         if dst in existing_symlinks:
             continue
-
         dst_path = root_dir / dst
         src_path = repo_dir / mapping["src"]
-
-        # Only convert regular files (not symlinks, not missing)
         if not dst_path.exists() or dst_path.is_symlink():
+            continue
+        candidates.append((dst, dst_path, src_path))
+
+    # Skip files tracked by the main repo — they belong to the main repo
+    # and should be recorded as conflicts, not replaced with symlinks.
+    tracked_by_main = set()
+    if candidates and (root_dir / ".git").exists():
+        candidate_dsts = [c[0] for c in candidates]
+        tracked_by_main = set(git.get_tracked_files(root_dir, candidate_dsts))
+
+    for dst, dst_path, src_path in candidates:
+        if dst in tracked_by_main:
+            new_conflicts.append(dst)
             continue
 
         # The file exists as a regular file and the same file is in the overlay
@@ -869,12 +903,15 @@ def _post_commit_symlink_sync(root_dir: Path, config: dict, output: Output) -> N
         new_symlinks.append(symlink_dst)
         output.created(f"{symlink_dst} (symlink)")
 
-    if new_symlinks:
+    if new_symlinks or new_conflicts:
         all_symlinks = sorted(set(existing_symlinks) | set(new_symlinks))
         old_dirs = state.get("created_directories", [])
         all_dirs = list(set(old_dirs) | set(new_dirs))
+        old_conflicts = set(state.get("conflicts", []))
+        all_conflicts = sorted((old_conflicts | set(new_conflicts)) - set(all_symlinks))
         state["symlinks"] = all_symlinks
         state["created_directories"] = all_dirs
+        state["conflicts"] = all_conflicts
         write_state(root_dir, state)
         try:
             update_exclude_file(root_dir, all_symlinks)

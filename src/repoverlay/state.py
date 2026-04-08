@@ -36,19 +36,22 @@ def read_state(root_dir: Path) -> dict[str, Any]:
                     "symlink_dst": "terraform/terraform.tfvars",
                     "last_encrypted_hash": "sha256:abc123..."
                 }
-            }
+            },
+            "conflicts": [...]
         }
     """
     state_path = get_state_path(root_dir)
 
     if not state_path.exists():
-        return {"symlinks": [], "created_directories": [], "encrypted_files": {}}
+        return {"symlinks": [], "created_directories": [], "encrypted_files": {}, "conflicts": []}
 
     with open(state_path) as f:
         state = json.load(f)
         # Ensure encrypted_files key exists for backwards compatibility
         if "encrypted_files" not in state:
             state["encrypted_files"] = {}
+        if "conflicts" not in state:
+            state["conflicts"] = []
         return state
 
 
