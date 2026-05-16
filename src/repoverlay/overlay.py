@@ -640,8 +640,13 @@ def sync_overlay(
         symlinks_created.append(symlink_dst)
         output.created(f"{symlink_dst} (decrypted)")
 
-    # Merge with existing symlinks that weren't removed
-    all_symlinks = list((old_symlinks - to_remove) | set(symlinks_created))
+    # Reconcile state with on-disk reality: any mapping (or encrypted file)
+    # whose destination is currently a correct symlink belongs in state — even
+    # if it was missing from old_symlinks and didn't need to be (re)created.
+    # Without this, an out-of-sync state file would silently drop managed
+    # symlinks and leave them out of .git/info/exclude.
+    on_disk_symlinks = {dst for dst in new_symlinks if (root_dir / dst).is_symlink()}
+    all_symlinks = list(on_disk_symlinks | set(symlinks_created))
 
     # Update state
     old_dirs = state.get("created_directories", [])

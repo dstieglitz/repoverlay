@@ -345,6 +345,60 @@ class TestCloneOverlay:
 class TestSyncOverlay:
     """Tests for sync_overlay function."""
 
+    def test_sync_writes_managed_symlinks_to_git_exclude(self, tmp_main_repo, sample_config):
+        """Sync ensures every managed symlink is listed in .git/info/exclude."""
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Wipe the managed section to simulate a repo whose exclude is out of date.
+        exclude_path = tmp_main_repo / ".git" / "info" / "exclude"
+        exclude_path.write_text("")
+
+        output = Output(quiet=True)
+        sync_overlay(tmp_main_repo, sample_config, output=output)
+
+        content = exclude_path.read_text()
+        state = read_state(tmp_main_repo)
+        for symlink in state["symlinks"]:
+            assert symlink in content, f"{symlink} missing from .git/info/exclude"
+        assert ".repoverlay.yaml" in content
+        assert ".repoverlayignore" in content
+        assert ".repoverlay/" in content
+
+    def test_sync_reconciles_on_disk_symlinks_missing_from_state(
+        self, tmp_main_repo, sample_config
+    ):
+        """Sync re-adds on-disk symlinks that have been dropped from state.json.
+
+        Reproduces a real-world case: a correct symlink exists on disk pointing
+        into the overlay repo, but is missing from state. Sync must include it
+        in state and in .git/info/exclude so git status doesn't show it as
+        untracked.
+        """
+        from repoverlay.state import write_state
+
+        clone_overlay(tmp_main_repo, sample_config)
+
+        # Drop one of the managed symlinks from state, leaving the symlink on disk.
+        state = read_state(tmp_main_repo)
+        assert "config/secrets" in state["symlinks"]
+        state["symlinks"] = [s for s in state["symlinks"] if s != "config/secrets"]
+        write_state(tmp_main_repo, state)
+
+        assert (tmp_main_repo / "config" / "secrets").is_symlink()
+
+        output = Output(quiet=True)
+        sync_overlay(tmp_main_repo, sample_config, output=output)
+
+        reconciled = read_state(tmp_main_repo)
+        assert "config/secrets" in reconciled["symlinks"], (
+            "sync should re-include on-disk symlinks dropped from state"
+        )
+
+        exclude_content = (tmp_main_repo / ".git" / "info" / "exclude").read_text()
+        assert "config/secrets" in exclude_content, (
+            "sync should ensure on-disk managed symlinks are in .git/info/exclude"
+        )
+
     def test_sync_removes_old_symlinks(self, tmp_main_repo, sample_config):
         """Sync removes symlinks no longer in config."""
         clone_overlay(tmp_main_repo, sample_config)
