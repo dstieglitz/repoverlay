@@ -1116,6 +1116,136 @@ class TestResetCommand:
         assert "?? file1.txt" in status_result.stdout
         assert "?? file2.txt" in status_result.stdout
 
+    @pytest.mark.parametrize("rev_style", ["symbolic", "hash"])
+    def test_reset_to_commit(self, tmp_main_repo, sample_config, rev_style):
+        """Reset command with a revision (HEAD~1 or a commit hash) moves the overlay branch back."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Create a commit to undo
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        new_file = repo_dir / "undo-me.txt"
+        new_file.write_text("undo me")
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(new_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "-m", "commit to undo"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        if rev_style == "symbolic":
+            target = "HEAD~1"
+        else:
+            target = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD~1"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset", target],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert f"reset to {target.lower()}" in result.stdout.lower()
+
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert head_after != head_before
+
+        # The undone commit's file is kept in the working tree as untracked
+        assert new_file.exists()
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert "?? undo-me.txt" in status_result.stdout
+
+    def test_reset_file_named_like_ref(self, tmp_main_repo, sample_config):
+        """A staged file whose name matches a ref is unstaged, not treated as a revision."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        # Stage a file named after the current branch
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        new_file = repo_dir / branch
+        new_file.write_text("file named like a ref")
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(new_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        head_before = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "reset", branch],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "unstaged" in result.stdout.lower()
+
+        # HEAD must not move; the file is unstaged
+        head_after = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert head_after == head_before
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        assert f"?? {branch}" in status_result.stdout
+
     def test_reset_with_absolute_path_outside_repo(self, tmp_main_repo, sample_config):
         """Reset command handles absolute paths outside repo."""
         config_path = tmp_main_repo / ".repoverlay.yaml"

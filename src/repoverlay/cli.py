@@ -163,8 +163,12 @@ def main() -> int:
     restore_parser.add_argument("--staged", "-S", action="store_true", help="Restore staged changes (unstage)")
     restore_parser.add_argument("files", nargs="+", help="Files to restore")
 
-    reset_parser = subparsers.add_parser("reset", help="Unstage files from overlay repo")
-    reset_parser.add_argument("files", nargs="*", help="Files to unstage (default: all staged files)")
+    reset_parser = subparsers.add_parser("reset", help="Unstage files or reset to a commit in overlay repo")
+    reset_parser.add_argument(
+        "files",
+        nargs="*",
+        help="Files to unstage (default: all staged files), optionally preceded by a commit to reset to (e.g. HEAD~1)",
+    )
 
     diff_parser = subparsers.add_parser("diff", help="Show diff in overlay repo")
     diff_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git diff arguments")
@@ -1628,11 +1632,23 @@ def cmd_reset(args, output: Output) -> int:
     # Filter out "HEAD" if user passed it (muscle memory from git reset HEAD)
     raw_files = [f for f in (args.files or []) if f != "HEAD"]
 
+    # A leading revision (e.g. HEAD~1, a branch, a hash) means git-style reset
+    # to that commit, as long as it isn't also an existing file.
+    rev = None
+    if raw_files:
+        candidate = raw_files[0]
+        path_like = (repo_dir / candidate).exists() or (Path.cwd() / candidate).exists()
+        if not path_like and git.is_commit(repo_dir, candidate):
+            rev = candidate
+            raw_files = raw_files[1:]
+
     if not raw_files:
-        # No files specified, reset all
         try:
-            git.reset(repo_dir, None)
-            output.success("All files unstaged.")
+            git.reset(repo_dir, None, rev=rev)
+            if rev:
+                output.success(f"Reset to {rev}. Changes are kept in the working tree.")
+            else:
+                output.success("All files unstaged.")
             return 0
         except git.GitError as e:
             output.error(str(e))
@@ -1680,7 +1696,7 @@ def cmd_reset(args, output: Output) -> int:
             files_to_reset.append(str(rel_path))
 
     try:
-        git.reset(repo_dir, files_to_reset)
+        git.reset(repo_dir, files_to_reset, rev=rev)
         output.success(f"Unstaged {len(files_to_reset)} file(s).")
         return 0
     except git.GitError as e:

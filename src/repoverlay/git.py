@@ -443,12 +443,33 @@ def has_commits(repo_dir: Path) -> bool:
     return result.returncode == 0
 
 
-def reset(repo_dir: Path, files: list[str] | None = None) -> None:
+def is_commit(repo_dir: Path, ref: str) -> bool:
+    """Check whether a ref resolves to a commit in the repository.
+
+    Args:
+        repo_dir: Path to the repository.
+        ref: Revision to check (e.g. "HEAD~1", a branch, a hash)
+
+    Returns:
+        True if the ref resolves to a commit.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref + "^{commit}"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def reset(repo_dir: Path, files: list[str] | None = None, rev: str | None = None) -> None:
     """Unstage files (git reset HEAD, or git rm --cached on empty repos).
 
     Args:
         repo_dir: Path to the repository.
         files: Files to unstage (if None, unstages all)
+        rev: Revision to reset to (default HEAD). Without files, a mixed
+            reset moves the current branch to this commit.
 
     Raises:
         GitError: If reset fails.
@@ -461,7 +482,7 @@ def reset(repo_dir: Path, files: list[str] | None = None) -> None:
             run_git(repo_dir, ["rm", "-r", "--cached", "."], capture=True)
         return
 
-    cmd = ["reset", "HEAD"]
+    cmd = ["reset", rev or "HEAD"]
     if files:
         cmd.extend(files)
     run_git(repo_dir, cmd, capture=True)
