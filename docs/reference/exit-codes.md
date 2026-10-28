@@ -25,5 +25,6 @@ Exit code `2` is returned when repoverlay completes partially:
 
 - One or more destination files already existed and were skipped
 - One or more SOPS decryptions failed (overlay still cloned, affected files skipped)
+- One or more mapping sources were not found in the overlay (clone/sync; those mappings skipped)
 
 Check the output for warning messages to understand what was skipped.

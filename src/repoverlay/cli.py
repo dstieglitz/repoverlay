@@ -421,7 +421,7 @@ def cmd_clone(args, output: Output) -> int:
     config, root_dir = result
 
     try:
-        clone_overlay(
+        exit_code = clone_overlay(
             root_dir,
             config,
             force=args.force,
@@ -436,7 +436,7 @@ def cmd_clone(args, output: Output) -> int:
     if args.intellij:
         configure_vcs_root(root_dir, dry_run=args.dry_run, output=output)
 
-    return 0
+    return exit_code
 
 
 def cmd_sync(args, output: Output) -> int:
@@ -851,15 +851,41 @@ def _post_commit_symlink_sync(root_dir: Path, config: dict, output: Output) -> N
     # Collect encrypted file paths to exclude from plain-file handling
     enc_file_strs = set(encrypted_files.keys())
 
-    # Build the full set of repo files so we catch files added via
-    # ``repoverlay add`` that may not appear in explicit mappings.
-    from .overlay import _generate_mappings_from_repo
+    # Only link files covered by the config's mappings, so that sync won't
+    # later remove the symlink as unmapped.
+    from .overlay import _generate_mappings_from_repo, resolve_mappings
     from .ignore import load_ignore_patterns, filter_mappings
     all_enc_files = sops.scan_encrypted_files(repo_dir)
     all_enc_strs = {str(f) for f in all_enc_files}
-    mappings = _generate_mappings_from_repo(repo_dir, encrypted_files, all_enc_strs)
     ignore_patterns = load_ignore_patterns(root_dir)
+    mappings = resolve_mappings(repo_dir, config["overlay"], encrypted_files, all_enc_strs)
     mappings = filter_mappings(mappings, ignore_patterns)
+
+    # Files copied in by ``repoverlay add`` that no mapping covers stay as
+    # regular files; tell the user how to link them.
+    mapped_dsts = {m["dst"] for m in mappings}
+    unmapped = [
+        m["dst"]
+        for m in filter_mappings(
+            _generate_mappings_from_repo(repo_dir, encrypted_files, all_enc_strs), ignore_patterns
+        )
+        if m["dst"] not in mapped_dsts
+        and m["dst"] not in existing_symlinks
+        and (root_dir / m["dst"]).is_file()
+        and not (root_dir / m["dst"]).is_symlink()
+        and filecmp.cmp(root_dir / m["dst"], repo_dir / m["src"], shallow=False)
+    ]
+    if unmapped:
+        output.warning(
+            f"{len(unmapped)} committed file(s) are not covered by mappings in .repoverlay.yaml "
+            "and were left as regular files:"
+        )
+        for dst in sorted(unmapped):
+            output.info(f"    {dst}")
+        output.info(
+            "  Add a mapping for them, or set 'include_unmapped: true' under 'overlay'\n"
+            "  to link every unmapped overlay file at its own path."
+        )
 
     new_symlinks = []
     new_dirs = []

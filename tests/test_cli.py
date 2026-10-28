@@ -851,6 +851,7 @@ class TestCommitCommand:
 
     def test_commit_auto_symlinks_new_files(self, tmp_main_repo, sample_config):
         """After add + commit, new files are automatically replaced with symlinks."""
+        sample_config["overlay"]["include_unmapped"] = True
         config_path = tmp_main_repo / ".repoverlay.yaml"
         config_path.write_text(yaml.dump(sample_config))
 
@@ -894,6 +895,43 @@ class TestCommitCommand:
         # The symlink should point into the overlay repo and be readable
         assert new_file.read_text() == "key: value"
 
+
+    def test_commit_leaves_unmapped_added_file_with_hint(self, tmp_main_repo, sample_config):
+        """Without include_unmapped, an added file outside the mappings stays a regular file."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        new_file = tmp_main_repo / "myconfig" / "settings.yaml"
+        new_file.parent.mkdir(parents=True)
+        new_file.write_text("key: value")
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "add", str(new_file)],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "-m", "add settings"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert not new_file.is_symlink()
+        assert "include_unmapped" in result.stdout + result.stderr
+
+        # A later sync must not remove the user's file
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "sync"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+        assert new_file.read_text() == "key: value"
 
     def test_commit_does_not_replace_differing_local_file(self, tmp_main_repo, tmp_overlay_repo):
         """Post-commit sync leaves an untracked local file alone if it differs from the overlay copy."""

@@ -14,6 +14,7 @@ from repoverlay.overlay import (
     clone_overlay,
     get_overlay_dir,
     get_repo_dir,
+    resolve_mappings,
     sync_overlay,
     unlink_overlay,
     verify_overlay,
@@ -191,14 +192,17 @@ class TestCloneOverlay:
         with pytest.raises(OverlayError, match="Already cloned"):
             clone_overlay(tmp_main_repo, sample_config)
 
-    def test_error_if_source_not_found(self, tmp_main_repo, sample_config):
-        """Error if source doesn't exist in overlay."""
-        sample_config["overlay"]["mappings"] = [
-            {"src": "nonexistent", "dst": "foo"}
-        ]
+    def test_skips_missing_source_with_warning(self, tmp_main_repo, sample_config, capsys):
+        """Missing sources are skipped with a warning; other mappings still apply."""
+        sample_config["overlay"]["mappings"].append({"src": "nonexistent", "dst": "foo"})
 
-        with pytest.raises(OverlayError, match="Source not found in overlay"):
-            clone_overlay(tmp_main_repo, sample_config)
+        exit_code = clone_overlay(tmp_main_repo, sample_config, output=Output(no_color=True))
+
+        assert exit_code == 2
+        assert "nonexistent" in capsys.readouterr().out
+        assert not (tmp_main_repo / "foo").exists()
+        assert (tmp_main_repo / ".env").is_symlink()
+        assert ".env" in read_state(tmp_main_repo)["symlinks"]
 
     def test_skips_if_destination_exists(self, tmp_main_repo, sample_config, capsys):
         """Skips files if destination already exists (with warning)."""
@@ -581,6 +585,87 @@ class TestSyncOverlay:
         # conflict.txt should now be a symlink with overlay content
         assert (tmp_main_repo / "conflict.txt").is_symlink()
         assert (tmp_main_repo / "conflict.txt").read_text() == "overlay content"
+
+
+class TestResolveMappings:
+    """Tests for resolve_mappings."""
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / "secrets").mkdir(parents=True)
+        (repo / "secrets" / "db.yaml").write_text("x")
+        (repo / "terraform.tfvars").write_text("x")
+        (repo / "extra.txt").write_text("x")
+        (repo / "config").mkdir()
+        (repo / "config" / "other.yaml").write_text("x")
+        return repo
+
+    def test_no_mappings_maps_every_file(self, tmp_path):
+        repo = self._repo(tmp_path)
+        mappings = resolve_mappings(repo, {"repo": "x"})
+        assert sorted(m["dst"] for m in mappings) == [
+            "config/other.yaml", "extra.txt", "secrets/db.yaml", "terraform.tfvars",
+        ]
+
+    def test_explicit_mappings_only_by_default(self, tmp_path):
+        repo = self._repo(tmp_path)
+        explicit = [{"src": "terraform.tfvars", "dst": "tf/terraform.tfvars"}]
+        assert resolve_mappings(repo, {"repo": "x", "mappings": explicit}) == explicit
+
+    def test_include_unmapped_adds_uncovered_files(self, tmp_path):
+        repo = self._repo(tmp_path)
+        explicit = [
+            {"src": "terraform.tfvars", "dst": "tf/terraform.tfvars"},
+            {"src": "secrets", "dst": "config/secrets"},
+        ]
+        mappings = resolve_mappings(
+            repo, {"repo": "x", "mappings": explicit, "include_unmapped": True}
+        )
+        # Explicit mappings first, then uncovered files at their own paths.
+        # secrets/db.yaml is covered by the "secrets" src; config/other.yaml is
+        # not covered (its dst doesn't overlap config/secrets).
+        assert mappings[:2] == explicit
+        assert sorted(m["dst"] for m in mappings[2:]) == ["config/other.yaml", "extra.txt"]
+
+    def test_include_unmapped_skips_dst_overlap(self, tmp_path):
+        repo = self._repo(tmp_path)
+        # Explicit dst "extra.txt" would collide with the generated mapping for extra.txt
+        explicit = [{"src": "terraform.tfvars", "dst": "extra.txt"}]
+        mappings = resolve_mappings(
+            repo, {"repo": "x", "mappings": explicit, "include_unmapped": True}
+        )
+        dsts = [m["dst"] for m in mappings]
+        assert dsts.count("extra.txt") == 1
+        assert "terraform.tfvars" not in dsts
+
+
+class TestSyncIncludeUnmapped:
+    """Tests for sync with include_unmapped and missing sources."""
+
+    def test_sync_links_unmapped_files(self, tmp_main_repo, sample_config):
+        clone_overlay(tmp_main_repo, sample_config, output=Output(quiet=True))
+        (get_repo_dir(tmp_main_repo) / "new.txt").write_text("new content")
+
+        sample_config["overlay"]["include_unmapped"] = True
+        sync_overlay(tmp_main_repo, sample_config, output=Output(quiet=True))
+
+        assert (tmp_main_repo / "new.txt").is_symlink()
+        assert (tmp_main_repo / ".env").is_symlink()
+        # secrets/db.yaml is covered by the explicit "secrets" mapping
+        assert not (tmp_main_repo / "secrets").exists()
+        assert "new.txt" in read_state(tmp_main_repo)["symlinks"]
+
+    def test_sync_skips_missing_source_with_warning(self, tmp_main_repo, sample_config, capsys):
+        clone_overlay(tmp_main_repo, sample_config, output=Output(quiet=True))
+
+        sample_config["overlay"]["mappings"].append({"src": "only-in-prod.txt", "dst": "prod.txt"})
+        exit_code = sync_overlay(tmp_main_repo, sample_config, output=Output(no_color=True))
+
+        assert exit_code == 2
+        assert "only-in-prod.txt" in capsys.readouterr().out
+        assert not (tmp_main_repo / "prod.txt").exists()
+        # Other mappings are still applied
+        assert (tmp_main_repo / ".env").is_symlink()
 
 
 class TestUnlinkOverlay:

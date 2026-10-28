@@ -121,6 +121,79 @@ def _generate_mappings_from_repo(
     return mappings
 
 
+def _paths_overlap(a: str, b: str) -> bool:
+    """Check if two relative paths are equal or one is inside the other."""
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def resolve_mappings(
+    repo_dir: Path,
+    overlay_config: dict[str, Any],
+    encrypted_files: dict[str, dict[str, str]] | None = None,
+    exclude_paths: set[str] | None = None,
+) -> list[dict]:
+    """Determine the mappings to apply for an overlay config.
+
+    Without explicit mappings, every overlay file maps to its own path. With
+    explicit mappings, only those are used unless ``include_unmapped`` is set,
+    in which case every overlay file not covered by an explicit mapping (by src
+    or dst) is also mapped to its own path.
+
+    Args:
+        repo_dir: Path to the overlay repository
+        overlay_config: The ``overlay`` section of the config
+        encrypted_files: Optional dict of encrypted file metadata from SOPS decryption
+        exclude_paths: Optional set of paths to exclude from generated mappings
+
+    Returns:
+        List of mapping dicts with src/dst keys
+
+    Raises:
+        OverlayError: If explicit mappings are invalid.
+    """
+    explicit_mappings = overlay_config.get("mappings")
+    if not explicit_mappings:
+        return _generate_mappings_from_repo(repo_dir, encrypted_files, exclude_paths)
+
+    try:
+        validate_mappings(explicit_mappings)
+    except ValidationError as e:
+        raise OverlayError(str(e))
+
+    if not overlay_config.get("include_unmapped"):
+        return explicit_mappings
+
+    generated = _generate_mappings_from_repo(repo_dir, encrypted_files, exclude_paths)
+    unmapped = [
+        m for m in generated
+        if not any(
+            _paths_overlap(m["src"], e["src"]) or _paths_overlap(m["dst"], e["dst"])
+            for e in explicit_mappings
+        )
+    ]
+    return list(explicit_mappings) + unmapped
+
+
+def _skip_missing_sources(
+    repo_dir: Path, mappings: list[dict], output: Output
+) -> tuple[list[dict], bool]:
+    """Drop mappings whose source is missing from the overlay, with a warning.
+
+    A mapping may name a file that only exists in another environment's
+    overlay; skipping it lets the remaining mappings still be applied.
+
+    Returns:
+        Tuple of (mappings with existing sources, whether any were skipped)
+    """
+    missing = [m for m in mappings if not (repo_dir / m["src"]).exists()]
+    if not missing:
+        return mappings, False
+    output.warning(f"{len(missing)} mapping source(s) not found in overlay, skipping:")
+    for m in missing:
+        output.info(f"    {m['src']}")
+    return [m for m in mappings if m not in missing], True
+
+
 def clone_overlay(
     root_dir: Path,
     config: dict[str, Any],
@@ -128,7 +201,7 @@ def clone_overlay(
     force: bool = False,
     dry_run: bool = False,
     output: Output | None = None,
-) -> None:
+) -> int:
     """Clone overlay repo and create symlinks.
 
     Args:
@@ -137,6 +210,9 @@ def clone_overlay(
         force: Overwrite existing .repoverlay/repo/
         dry_run: Preview changes without making them
         output: Output handler
+
+    Returns:
+        Exit code (0 success, 2 partial/warnings)
 
     Raises:
         OverlayError: If operation fails.
@@ -197,9 +273,11 @@ def clone_overlay(
             mappings = filter_mappings(explicit_mappings, ignore_patterns)
             for mapping in mappings:
                 output.info(f"{output.dry_run_prefix()} Would create symlink {output.path(mapping['dst'])}")
+            if overlay_config.get("include_unmapped"):
+                output.info(f"{output.dry_run_prefix()} Would also symlink unmapped overlay files at their own paths")
         else:
             output.info(f"{output.dry_run_prefix()} Would create symlinks for all files in overlay")
-        return
+        return 0
 
     # Create .repoverlay directory
     overlay_dir.mkdir(parents=True, exist_ok=True)
@@ -268,16 +346,8 @@ def clone_overlay(
         except sops.SopsDecryptionError as e:
             raise OverlayError(str(e))
 
-    # Generate mappings if not provided
-    if explicit_mappings:
-        mappings = explicit_mappings
-        # Validate explicit mappings
-        try:
-            validate_mappings(mappings)
-        except ValidationError as e:
-            raise OverlayError(str(e))
-    else:
-        mappings = _generate_mappings_from_repo(repo_dir, encrypted_files)
+    mappings = resolve_mappings(repo_dir, overlay_config, encrypted_files)
+    mappings, skipped_missing = _skip_missing_sources(repo_dir, mappings, output)
 
     # Load ignore patterns and filter mappings
     ignore_patterns = load_ignore_patterns(root_dir)
@@ -374,6 +444,7 @@ def clone_overlay(
         )
 
     output.success("Overlay cloned and symlinks created successfully.")
+    return 2 if skipped_missing else 0
 
 
 def sync_overlay(
@@ -468,18 +539,12 @@ def sync_overlay(
             output.warning(f"Failed to re-decrypt some files: {e}")
             exit_code = 2
 
-    # Generate or use explicit mappings
-    explicit_mappings = overlay_config.get("mappings")
-    if explicit_mappings:
-        mappings = explicit_mappings
-        # Validate explicit mappings
-        try:
-            validate_mappings(mappings)
-        except ValidationError as e:
-            raise OverlayError(str(e))
-    else:
-        # Exclude all encrypted files from regular mappings (even if decryption failed)
-        mappings = _generate_mappings_from_repo(repo_dir, encrypted_files, all_enc_file_strs)
+    # Exclude all encrypted files from generated mappings (even if decryption failed)
+    mappings = resolve_mappings(repo_dir, overlay_config, encrypted_files, all_enc_file_strs)
+
+    mappings, skipped_missing = _skip_missing_sources(repo_dir, mappings, output)
+    if skipped_missing:
+        exit_code = 2
 
     # Check repo URL mismatch (only for git repos)
     repo_url = overlay_config["repo"]

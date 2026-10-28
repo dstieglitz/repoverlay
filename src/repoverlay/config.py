@@ -118,6 +118,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             if dst.startswith("/"):
                 raise ConfigError(f"Destination must be relative: {dst}")
 
+    # Validate include_unmapped (optional bool)
+    if "include_unmapped" in overlay and not isinstance(overlay["include_unmapped"], bool):
+        raise ConfigError("Invalid config: include_unmapped must be true or false")
+
     # Validate sops_config (optional string, relative path)
     if "sops_config" in overlay:
         sops_config = overlay["sops_config"]

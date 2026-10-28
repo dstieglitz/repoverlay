@@ -31,6 +31,7 @@ overlay:
 | `overlay.repo` | Yes | Git URL or local path of overlay repository |
 | `overlay.ref` | No | Branch, tag, or commit to checkout |
 | `overlay.mappings` | No | List of source/destination mappings. If omitted, all files in the overlay are symlinked using their original paths |
+| `overlay.include_unmapped` | No | When `true`, overlay files not covered by `mappings` are also symlinked at their original paths. Defaults to `false` |
 | `overlay.sops_config` | No | Path to `.sops.yaml` in overlay repo. Defaults to `.config/.sops.yaml` or `.sops.yaml` |
 | `overlay.encrypt_patterns` | No | Glob patterns for auto-encrypting files on `repoverlay add` or `repoverlay import` |
 | `mappings[].src` | Yes | Path in overlay repo |
@@ -57,6 +58,28 @@ overlay:
 ```
 
 If the overlay repo contains `terraform/terraform.tfvars` and `ansible/inventory`, symlinks will be created at those exact paths in your project.
+
+### Mappings Plus Everything Else
+
+By default, explicit `mappings` act as an allowlist: only the listed files are linked. Set `include_unmapped: true` to treat them as exceptions instead — every other overlay file is linked at its original path:
+
+```yaml
+version: 1
+overlay:
+  repo: git@github.com:yourorg/config-prod.git
+  include_unmapped: true
+  mappings:
+    - src: terraform.tfvars
+      dst: terraform/terraform.tfvars
+```
+
+An overlay file is left out of the "everything else" set when its path equals or sits inside an explicit mapping's `src` or `dst`, so it is never linked twice.
+
+This matters for `repoverlay add`: after you add and commit a new file, repoverlay replaces your local copy with a symlink only if a mapping covers it. With explicit mappings and `include_unmapped` off, the file stays a regular file and `commit` prints a hint.
+
+### Missing Sources
+
+If a mapping's `src` doesn't exist in the overlay (for example, a file present only in another environment's overlay), `repoverlay clone` and `repoverlay sync` warn, skip that mapping, apply the rest, and exit with code 2.
 
 ## Local Repositories
 

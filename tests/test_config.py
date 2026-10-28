@@ -68,6 +68,15 @@ class TestValidateConfig:
         with pytest.raises(ConfigError, match="Missing required field: mappings"):
             validate_config(sample_config)
 
+    def test_include_unmapped_bool(self, sample_config):
+        sample_config["overlay"]["include_unmapped"] = True
+        assert validate_config(sample_config)["overlay"]["include_unmapped"] is True
+
+    def test_include_unmapped_not_bool(self, sample_config):
+        sample_config["overlay"]["include_unmapped"] = "yes"
+        with pytest.raises(ConfigError, match="include_unmapped"):
+            validate_config(sample_config)
+
     def test_mapping_missing_dst(self, sample_config):
         """Mapping missing dst errors."""
         del sample_config["overlay"]["mappings"][0]["dst"]
