@@ -30,6 +30,9 @@ from .overlay import (
 )
 from .state import read_state, write_state
 
+# Commands whose arguments are handed to the matching git command unchanged
+PASSTHROUGH_COMMANDS = ("diff", "log", "branch")
+
 
 def main() -> int:
     """Main entry point.
@@ -176,6 +179,9 @@ def main() -> int:
     log_parser = subparsers.add_parser("log", help="Show commit log of overlay repo")
     log_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git log arguments")
 
+    branch_parser = subparsers.add_parser("branch", help="List, create, or delete branches in overlay repo")
+    branch_parser.add_argument("args", nargs=argparse.REMAINDER, help="Additional git branch arguments")
+
     checkout_parser = subparsers.add_parser("checkout", help="Checkout ref in overlay repo and sync")
     checkout_parser.add_argument("-b", dest="new_branch", action="store_true", help="Create a new branch")
     checkout_parser.add_argument("ref", help="Branch, tag, or commit to checkout")
@@ -257,7 +263,22 @@ def main() -> int:
         help="Preview changes without executing",
     )
 
-    args = parser.parse_args()
+    # Pass everything after a passthrough command to git verbatim; argparse would
+    # otherwise reject or reorder git's own flags (e.g. "log --oneline", "branch -d foo")
+    argv = sys.argv[1:]
+    passthrough_args = None
+    for i, arg in enumerate(argv):
+        if not arg.startswith("-"):
+            if arg in PASSTHROUGH_COMMANDS:
+                passthrough_args = argv[i + 1:]
+                if passthrough_args[:1] == ["--"]:
+                    passthrough_args = passthrough_args[1:]
+                argv = argv[:i + 1]
+            break
+
+    args = parser.parse_args(argv)
+    if passthrough_args is not None:
+        args.args = passthrough_args
 
     # Set up output handler
     output = Output(no_color=args.no_color, quiet=args.quiet)
@@ -283,6 +304,7 @@ def main() -> int:
         "reset": lambda: cmd_reset(args, output),
         "diff": lambda: cmd_diff(args, output),
         "log": lambda: cmd_log(args, output),
+        "branch": lambda: cmd_branch(args, output),
         "checkout": lambda: cmd_checkout(args, output),
         "merge": lambda: cmd_merge(args, output),
         "list": lambda: cmd_list(output),
@@ -1776,6 +1798,16 @@ def cmd_log(args, output: Output) -> int:
     repo_dir, _ = result
 
     return git.log(repo_dir, args.args if args.args else None).returncode
+
+
+def cmd_branch(args, output: Output) -> int:
+    """Execute git branch in overlay repo."""
+    result = _get_repo_dir_or_error(output)
+    if result is None:
+        return 1
+    repo_dir, _ = result
+
+    return git.branch(repo_dir, args.args if args.args else None).returncode
 
 
 def cmd_checkout(args, output: Output) -> int:

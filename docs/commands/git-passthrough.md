@@ -12,6 +12,7 @@ repoverlay provides passthrough commands for common git operations that run in t
 | `repoverlay push` | Push overlay changes |
 | `repoverlay diff [args]` | Show overlay diff |
 | `repoverlay log [args]` | Show overlay commit log |
+| `repoverlay branch [args]` | List branches (no args), or create/delete/rename branches; args go to `git branch` as-is |
 | `repoverlay add [-e] <files>` | Stage files in overlay (`-e`/`--encrypt` to encrypt with SOPS) |
 | `repoverlay restore [-S] <files>` | Restore files in overlay (`-S`/`--staged` to unstage) |
 | `repoverlay reset [files]` | Unstage files from overlay (defaults to all staged) |
@@ -19,6 +20,18 @@ repoverlay provides passthrough commands for common git operations that run in t
 | `repoverlay checkout [-b] <ref>` | Checkout ref (or create branch with `-b`), then sync symlinks |
 | `repoverlay merge <branch>` | Merge branch, then sync symlinks |
 | `repoverlay repair` | Rebuild state from filesystem |
+
+## Passing Arguments to git
+
+`diff`, `log`, and `branch` hand everything after the command name to git unchanged, so git's own flags work directly:
+
+```bash
+repoverlay log --oneline -10
+repoverlay diff --stat
+repoverlay branch -d old-feature
+```
+
+A leading `--` (e.g. `repoverlay log -- --oneline`) is accepted for compatibility and dropped before calling git.
 
 ## Syncing After Pull / Checkout / Merge
 

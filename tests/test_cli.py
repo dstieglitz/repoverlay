@@ -326,9 +326,8 @@ class TestCLI:
             capture_output=True,
         )
 
-        # Use -- to separate repoverlay args from git args
         result = subprocess.run(
-            [sys.executable, "-m", "repoverlay", "diff", "--", "--stat"],
+            [sys.executable, "-m", "repoverlay", "diff", "--stat"],
             cwd=tmp_main_repo,
             capture_output=True,
             text=True,
@@ -374,6 +373,48 @@ class TestCLI:
         )
         assert result.returncode == 0
 
+    def test_log_passes_long_flags_without_separator(self, tmp_main_repo, sample_config):
+        """Log command accepts git long options without '--'."""
+        self._clone(tmp_main_repo, sample_config)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "log", "--oneline", "-1"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert len(result.stdout.strip().splitlines()) == 1
+
+    def test_log_separator_is_not_passed_to_git(self, tmp_main_repo, sample_config):
+        """A leading '--' is dropped so git sees '-1' as an option, not a path."""
+        self._clone(tmp_main_repo, sample_config)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "log", "--", "--format=%H", "-1"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert len(result.stdout.strip().splitlines()) == 1
+
+    def test_diff_passes_flags_without_separator(self, tmp_main_repo, sample_config):
+        """Diff command passes git flags through in order without '--'."""
+        self._clone(tmp_main_repo, sample_config)
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        changed = next(f for f in sorted(repo_dir.rglob("*")) if f.is_file() and ".git" not in f.parts)
+        changed.write_text(changed.read_text() + "extra\n")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "diff", "--stat", "--no-color"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "1 file changed" in result.stdout
+
     def test_log_without_clone_errors(self, tmp_main_repo, sample_config):
         """Log command errors if overlay not cloned."""
         config_path = tmp_main_repo / ".repoverlay.yaml"
@@ -385,6 +426,87 @@ class TestCLI:
             capture_output=True,
             text=True,
         )
+        assert result.returncode == 1
+
+    def _clone(self, tmp_main_repo, sample_config):
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+    def _branch(self, tmp_main_repo, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "repoverlay", "branch", *args],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+
+    def _overlay_branches(self, tmp_main_repo):
+        result = subprocess.run(
+            ["git", "branch", "--format=%(refname:short)"],
+            cwd=tmp_main_repo / ".repoverlay" / "repo",
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.split()
+
+    def test_branch_lists_branches(self, tmp_main_repo, sample_config):
+        """Branch command without args lists overlay branches."""
+        self._clone(tmp_main_repo, sample_config)
+
+        result = self._branch(tmp_main_repo)
+        assert result.returncode == 0
+        assert "* " in result.stdout
+
+    def test_branch_passes_flags_to_git(self, tmp_main_repo, sample_config):
+        """Branch command passes git flags through without '--'."""
+        self._clone(tmp_main_repo, sample_config)
+
+        result = self._branch(tmp_main_repo, "-a")
+        assert result.returncode == 0
+        assert "remotes/origin/" in result.stdout
+
+    def test_branch_create_and_delete(self, tmp_main_repo, sample_config):
+        """Branch command creates and deletes branches in overlay repo."""
+        self._clone(tmp_main_repo, sample_config)
+
+        assert self._branch(tmp_main_repo, "feature-x").returncode == 0
+        assert "feature-x" in self._overlay_branches(tmp_main_repo)
+
+        # Flag before the branch name must keep its position
+        assert self._branch(tmp_main_repo, "-d", "feature-x").returncode == 0
+        assert "feature-x" not in self._overlay_branches(tmp_main_repo)
+
+    def test_branch_with_global_flag_and_separator(self, tmp_main_repo, sample_config):
+        """Global flags before 'branch' still work, and a leading '--' is ignored."""
+        self._clone(tmp_main_repo, sample_config)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "--no-color", "branch", "--", "--show-current"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() in self._overlay_branches(tmp_main_repo)
+
+    def test_branch_propagates_git_failure(self, tmp_main_repo, sample_config):
+        """Branch command returns git's exit code on failure."""
+        self._clone(tmp_main_repo, sample_config)
+
+        result = self._branch(tmp_main_repo, "-d", "no-such-branch")
+        assert result.returncode != 0
+
+    def test_branch_without_clone_errors(self, tmp_main_repo, sample_config):
+        """Branch command errors if overlay not cloned."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+
+        result = self._branch(tmp_main_repo)
         assert result.returncode == 1
 
     def test_merge_command(self, tmp_main_repo, tmp_overlay_repo):

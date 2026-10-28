@@ -371,6 +371,22 @@ def log(repo_dir: Path, args: list[str] | None = None) -> subprocess.CompletedPr
     return run_git(repo_dir, cmd, capture=False)
 
 
+def branch(repo_dir: Path, args: list[str] | None = None) -> subprocess.CompletedProcess:
+    """List, create, or delete branches.
+
+    Args:
+        repo_dir: Path to the repository.
+        args: Additional arguments
+
+    Returns:
+        CompletedProcess result
+    """
+    cmd = ["branch"]
+    if args:
+        cmd.extend(args)
+    return run_git(repo_dir, cmd, capture=False)
+
+
 def rm(repo_dir: Path, files: list[str], *, cached: bool = False) -> None:
     """Remove files from the repository.
 
