@@ -1,5 +1,6 @@
 """Tests for CLI module."""
 
+import json
 import os
 import subprocess
 import sys
@@ -892,6 +893,85 @@ class TestCommitCommand:
         )
         # The symlink should point into the overlay repo and be readable
         assert new_file.read_text() == "key: value"
+
+
+    def test_commit_does_not_replace_differing_local_file(self, tmp_main_repo, tmp_overlay_repo):
+        """Post-commit sync leaves an untracked local file alone if it differs from the overlay copy."""
+        (tmp_overlay_repo / "notes.txt").write_text("overlay version")
+        subprocess.run(["git", "add", "notes.txt"], cwd=tmp_overlay_repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add notes"], cwd=tmp_overlay_repo, capture_output=True)
+
+        config = {
+            "version": 1,
+            "overlay": {
+                "repo": str(tmp_overlay_repo),
+                "mappings": [{"src": ".env.production", "dst": ".env"}],
+            },
+        }
+        (tmp_main_repo / ".repoverlay.yaml").write_text(yaml.dump(config))
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+
+        local_notes = tmp_main_repo / "notes.txt"
+        local_notes.write_text("my own notes")
+
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        (repo_dir / ".env.production").write_text("CHANGED=1")
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "-a", "-m", "edit env"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+        assert not local_notes.is_symlink()
+        assert local_notes.read_text() == "my own notes"
+        state = json.loads((tmp_main_repo / ".repoverlay" / "state.json").read_text())
+        assert "notes.txt" not in state["symlinks"]
+
+    def test_commit_passes_git_flags(self, tmp_main_repo, sample_config):
+        """Commit passes git flags such as --amend through to git."""
+        config_path = tmp_main_repo / ".repoverlay.yaml"
+        config_path.write_text(yaml.dump(sample_config))
+        subprocess.run(
+            [sys.executable, "-m", "repoverlay", "clone"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+        )
+        repo_dir = tmp_main_repo / ".repoverlay" / "repo"
+        (repo_dir / "secrets" / "db.yaml").write_text("password: v2")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "-a", "-m", "first"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        count_before = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"], cwd=repo_dir, capture_output=True, text=True
+        ).stdout.strip()
+
+        result = subprocess.run(
+            [sys.executable, "-m", "repoverlay", "commit", "--amend", "-m", "amended"],
+            cwd=tmp_main_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+        log = subprocess.run(
+            ["git", "log", "-1", "--format=%s"], cwd=repo_dir, capture_output=True, text=True
+        )
+        assert log.stdout.strip() == "amended"
+        count_after = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"], cwd=repo_dir, capture_output=True, text=True
+        ).stdout.strip()
+        assert count_after == count_before
 
 
 class TestAddCommand:

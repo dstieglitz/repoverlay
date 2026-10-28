@@ -1,6 +1,7 @@
 """Command-line interface."""
 
 import argparse
+import filecmp
 import os
 import subprocess
 import sys
@@ -31,7 +32,7 @@ from .overlay import (
 from .state import read_state, write_state
 
 # Commands whose arguments are handed to the matching git command unchanged
-PASSTHROUGH_COMMANDS = ("diff", "log", "branch")
+PASSTHROUGH_COMMANDS = ("diff", "log", "branch", "commit")
 
 
 def main() -> int:
@@ -137,9 +138,7 @@ def main() -> int:
     subparsers.add_parser("push", help="Push overlay repo changes")
 
     commit_parser = subparsers.add_parser("commit", help="Commit changes in overlay repo")
-    commit_parser.add_argument("-a", "--all", action="store_true", help="Automatically stage modified/deleted files")
-    commit_parser.add_argument("-m", "--message", help="Commit message")
-    commit_parser.add_argument("args", nargs="*", help="Additional git commit arguments")
+    commit_parser.add_argument("args", nargs=argparse.REMAINDER, help="git commit arguments (e.g. -a -m MSG, --amend)")
 
     add_parser = subparsers.add_parser("add", help="Add files to overlay repo staging")
     add_parser.add_argument("files", nargs="+", help="Files to add")
@@ -874,7 +873,11 @@ def _post_commit_symlink_sync(root_dir: Path, config: dict, output: Output) -> N
             continue
         dst_path = root_dir / dst
         src_path = repo_dir / mapping["src"]
-        if not dst_path.exists() or dst_path.is_symlink():
+        if dst_path.is_symlink() or not dst_path.is_file() or not src_path.is_file():
+            continue
+        # Only replace files that are copies of the overlay file (e.g. from
+        # ``repoverlay add``); anything else is the user's own data.
+        if not filecmp.cmp(dst_path, src_path, shallow=False):
             continue
         candidates.append((dst, dst_path, src_path))
 
@@ -890,8 +893,8 @@ def _post_commit_symlink_sync(root_dir: Path, config: dict, output: Output) -> N
             new_conflicts.append(dst)
             continue
 
-        # The file exists as a regular file and the same file is in the overlay
-        # repo — replace it with a symlink.
+        # The file is identical to the one in the overlay repo — replace it
+        # with a symlink.
         rel_symlink = os.path.relpath(src_path, dst_path.parent)
         dst_path.unlink()
         dst_path.symlink_to(rel_symlink)
@@ -920,7 +923,9 @@ def _post_commit_symlink_sync(root_dir: Path, config: dict, output: Output) -> N
         dst_path = root_dir / symlink_dst
         src_path = decoded_dir / decoded_path
 
-        if not dst_path.exists() or dst_path.is_symlink() or not src_path.exists():
+        if dst_path.is_symlink() or not dst_path.is_file() or not src_path.is_file():
+            continue
+        if not filecmp.cmp(dst_path, src_path, shallow=False):
             continue
 
         rel_symlink = os.path.relpath(src_path, dst_path.parent)
@@ -995,12 +1000,7 @@ def cmd_commit(args, output: Output) -> int:
             return 1
 
     try:
-        extra_args = []
-        if args.all:
-            extra_args.append("-a")
-        if args.args:
-            extra_args.extend(args.args)
-        git.commit(repo_dir, message=args.message, args=extra_args if extra_args else None)
+        git.commit(repo_dir, args=args.args if args.args else None)
         output.success("Commit complete.")
     except git.GitError as e:
         output.error(str(e))
