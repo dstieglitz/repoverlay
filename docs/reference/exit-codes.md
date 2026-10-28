@@ -4,14 +4,14 @@
 |------|---------|
 | `0` | Success — all operations completed without errors |
 | `1` | Error — operation failed |
-| `2` | Partial success — some operations completed, but warnings were raised (e.g., files skipped due to conflicts) |
+| `2` | Partial success — the command completed, but raised warnings that need attention (e.g., a mapping source was missing) |
 
 ## Using Exit Codes in Scripts
 
 ```bash
-repoverlay clone
+repoverlay sync
 if [ $? -eq 2 ]; then
-    echo "Some files were skipped — check for conflicts"
+    echo "Sync completed with warnings — check the output"
 fi
 
 # Or use set -e to fail on any non-zero exit
@@ -21,10 +21,25 @@ repoverlay clone   # exits script on error
 
 ## Exit Code 2 Scenarios
 
-Exit code `2` is returned when repoverlay completes partially:
+Exit code `2` is returned when a command completes but raises warnings. Which warnings count depends on the command.
 
-- One or more destination files already existed and were skipped
-- One or more SOPS decryptions failed (overlay still cloned, affected files skipped)
-- One or more mapping sources were not found in the overlay (clone/sync; those mappings skipped)
+### `clone`
+
+- One or more mapping sources were not found in the overlay (those mappings are skipped)
+
+Destinations that already exist are skipped with a warning but do **not** change the exit code. SOPS decryption failures during `clone` are errors (exit code `1`).
+
+### `sync`, `pull`, `checkout`, `merge`
+
+`pull`, `checkout`, and `merge` run `sync` afterwards and return its exit code.
+
+- One or more mapping sources were not found in the overlay (those mappings are skipped)
+- New encrypted files were found but SOPS is not installed
+- One or more SOPS decryptions or re-decryptions failed (affected files skipped)
+- The cloned repo's remote URL doesn't match `overlay.repo` in the config
+- One or more destinations match a `.gitignore` pattern
+- One or more managed symlinks were replaced by regular files (rerun with `--force` to recreate them)
+
+Destinations that already exist are skipped with a warning but do **not** change the exit code.
 
 Check the output for warning messages to understand what was skipped.
